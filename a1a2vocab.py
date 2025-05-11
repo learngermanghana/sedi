@@ -1,6 +1,9 @@
 import streamlit as st
 import random
 import re
+import os
+import pandas as pd
+from datetime import datetime
 
 st.title("German Vocabulary Quiz")
 st.write("Welcome to the German Vocabulary Quiz by **Learn Language Education Academy**.")
@@ -24,18 +27,17 @@ a1_vocab = [
     ("der Markt", "market"), ("der Flughafen", "airport"), ("der Bahnhof", "train station"),
     ("die Haltestelle", "bus stop"), ("die Fahrt", "ride"), ("das Ticket", "ticket"), ("der Zug", "train"),
     ("der Bus", "bus"), ("das Taxi", "taxi"), ("das Auto", "car"), ("die Ampel", "traffic light"),
-    ("die Kreuzung", "intersection"), ("der Parkplatz", "parking lot"), ("der Fahrplan", "schedule")
+    ("die Kreuzung", "intersection"), ("der Parkplatz", "parking lot"), ("der Fahrplan", "schedule"),
+    ("zumachen", "to close"), ("aufmachen", "to open"), ("ausmachen", "to turn off"),
+    ("übernachten", "to stay overnight"), ("anfangen", "to begin"), ("vereinbaren", "to arrange"),
+    ("einsteigen", "to get in / board"), ("umsteigen", "to change (trains)"), ("aussteigen", "to get out / exit"),
+    ("anschalten", "to switch on"), ("ausschalten", "to switch off"),
+    ("Anreisen", "to arrive"), ("Ankommen", "to arrive"), 
+    ("Abreisen", "to depart"), ("Absagen", "to cancel"),
+    ("Zusagen", "to agree"), ("günstig", "cheap"), ("billig", "inexpensive")
 ]
 
-# --- SMART CLEANING FUNCTION ---
-def clean_answer(text):
-    text = text.lower().strip()
-    text = re.sub(r'\b(the|a|an|to)\b', '', text)
-    text = re.sub(r'[^a-z\s]', '', text)
-    words = text.split()
-    words.sort()
-    return ' '.join(words)
-# --- FULL A2 VOCABULARY ---
+# --- A2 VOCABULARY ---
 a2_vocab = [
     ("die Verantwortung", "responsibility"), ("die Besprechung", "meeting"), ("die Überstunden", "overtime"),
     ("laufen", "to run"), ("das Fitnessstudio", "gym"), ("die Entspannung", "relaxation"), ("der Müll", "waste, garbage"),
@@ -78,120 +80,172 @@ a2_vocab = [
     ("aussetzen", "to skip"), ("beenden", "to finish"), ("die Steckdose", "socket"), ("die Salbe", "ointment")
 ]
 
+# --- SMART CLEANING FUNCTION ---
+def clean_answer(text):
+    text = text.lower().strip()
+    text = re.sub(r'\b(the|a|an|to)\b', '', text)
+    text = re.sub(r'[^a-z\s]', '', text)
+    words = text.split()
+    words.sort()
+    return ' '.join(words)
+
 # --- SYNONYMS DICTIONARY ---
 extra_synonyms = {
-    "retten": ["rescue", "save"],
-    "laufen": ["to run", "run"],
-    "tragen": ["to carry", "carry"],
-    "beenden": ["to finish", "to end"],
-    "verletzt": ["injured", "hurt"],
-    "schmutzig": ["dirty", "unclean"],
-    "deprimiert": ["depressed", "sad"],
-    "bauen": ["to build", "construct"],
-    "erfahren": ["to learn", "to find out", "find out"],
-    "aufbleiben": ["to stay up", "remain awake"],
-    "baden": ["to bathe", "to swim"],
-    "kennenlernen": ["to get to know", "meet"],
-    "streiten": ["to argue", "to fight"],
-    "böse": ["angry", "evil", "mad"],
-    "kaputt": ["broken", "damaged"]
+    "retten": ["rescue", "save"], "laufen": ["to run", "run"], "tragen": ["to carry", "carry"],
+    "beenden": ["to finish", "to end"], "verletzt": ["injured", "hurt"], "schmutzig": ["dirty", "unclean"],
+    "deprimiert": ["depressed", "sad"], "bauen": ["to build", "construct"], "erfahren": ["to learn", "to find out", "find out"],
+    "aufbleiben": ["to stay up", "remain awake"], "baden": ["to bathe", "to swim"], "kennenlernen": ["to get to know", "meet"],
+    "streiten": ["to argue", "to fight"], "böse": ["angry", "evil", "mad"], "kaputt": ["broken", "damaged"]
 }
+# --- STUDENT ID ACCESS ---
+valid_ids = ["student001", "student002", "student003"]  # Add your own list
+student_id = st.text_input("Enter your Student ID:")
+if student_id.strip() not in valid_ids:
+    st.warning("Access restricted. Please enter a valid Student ID to continue.")
+    st.stop()
 
-# --- SESSION SETUP ---
-level = st.selectbox("Select the level", ["A1", "A2"])
-vocab_list = a1_vocab if level == "A1" else a2_vocab
+# --- QUIZ MODE SWITCH ---
+mode = st.radio("Choose Quiz Mode:", ["Vocabulary Quiz", "Grammar Quiz"])
 
-num_words = st.slider("How many words do you want to answer?", min_value=5, max_value=len(vocab_list), step=1)
-st.write(f"Total available: {len(vocab_list)}")
+# ========================
+# GRAMMAR QUIZ SECTION
+# ========================
+if mode == "Grammar Quiz":
+    topic = st.selectbox("Select grammar topic:", ["All Topics", "Articles", "Pronouns", "Modal Verbs", "Verb Conjugation", "Prepositions", "Word Order"])
 
-if "quiz_vocab" not in st.session_state or st.session_state.get("level") != level or st.session_state.get("num_words") != num_words:
-    st.session_state.quiz_vocab = random.sample(vocab_list, num_words)
-    st.session_state.current_index = 0
-    st.session_state.score = 0
-    st.session_state.started = False
-    st.session_state.submitted = False
-    st.session_state.answers = []
-    st.session_state.level = level
-    st.session_state.num_words = num_words
-if st.button("Start Quiz") and not st.session_state.started:
-    st.session_state.current_index = 0
-    st.session_state.score = 0
-    st.session_state.started = True
-    st.session_state.submitted = False
-    st.session_state.answers = []
-    st.session_state.quiz_vocab = random.sample(vocab_list, num_words)
+    all_questions = [
+        {"topic": "Articles", "question": "What is the article for 'Tisch'?", "options": ["der", "die", "das"], "answer": "der"},
+        {"topic": "Pronouns", "question": "Which pronoun fits 'Lisa'?", "options": ["sie", "er", "es"], "answer": "sie"},
+        {"topic": "Modal Verbs", "question": "Ich ___ gehen.", "options": ["muss", "kann", "will"], "answer": "muss"},
+        {"topic": "Verb Conjugation", "question": "Ich ___ müde.", "options": ["bin", "bist", "seid"], "answer": "bin"},
+        {"topic": "Prepositions", "question": "Ich gehe ___ Schule.", "options": ["zur", "in", "an"], "answer": "zur"},
+        {"topic": "Word Order", "question": "Morgen ___ ich ins Kino.", "options": ["gehe", "ich gehe", "geht"], "answer": "gehe"}
+        # ... add more if needed
+    ]
+    grammar_questions = all_questions if topic == "All Topics" else [q for q in all_questions if q["topic"] == topic]
+    random.shuffle(grammar_questions)
 
-if st.session_state.started:
-    total = len(st.session_state.quiz_vocab)
+    if "grammar_index" not in st.session_state:
+        st.session_state.grammar_index = 0
+        st.session_state.grammar_score = 0
 
-    if st.session_state.current_index < total:
-        word, correct_answer = st.session_state.quiz_vocab[st.session_state.current_index]
+    if st.session_state.grammar_index < len(grammar_questions):
+        current = grammar_questions[st.session_state.grammar_index]
+        st.subheader(f"Question {st.session_state.grammar_index + 1} of {len(grammar_questions)}")
+        st.write(current["question"])
+        user_choice = st.radio("Choose one:", current["options"], key=f"gq{st.session_state.grammar_index}")
 
-        st.progress((st.session_state.current_index + 1) / total)
-        st.subheader(f"Question {st.session_state.current_index + 1} of {total}")
-        st.subheader(f"Translate to English: '{word}'")
+        if st.button("Submit Answer"):
+            explanations = {
+                "Tisch": "'Tisch' is masculine → der Tisch.",
+                "Lisa": "Lisa is a girl's name → sie.",
+                "Ich ___ gehen.": "'muss' expresses necessity.",
+                "Ich ___ müde.": "Ich → bin.",
+                "Ich gehe ___ Schule.": "'zur' = zu + der (dative).",
+                "Morgen ___ ich": "Verb 2nd → gehe."
+            }
+            key = current["question"].split("'")[1] if "'" in current["question"] else current["question"]
+            if user_choice == current["answer"]:
+                st.success("Correct!")
+                st.info(explanations.get(key, "Nice work!"))
+                st.session_state.grammar_score += 1
+            else:
+                st.error(f"Wrong. Correct answer: {current['answer']}")
+                st.info(explanations.get(key, "Remember the grammar rule."))
 
-        user_input = st.text_input("Your answer:", key=f"input_{st.session_state.current_index}")
-
-        if not st.session_state.submitted:
-            if st.button("Submit"):
-                student = clean_answer(user_input)
-                correct = clean_answer(correct_answer)
-
-                # Synonyms matching
-                word_key = word.lower().split()[0]  # base word only
-                accepted_answers = [correct]
-                if word_key in extra_synonyms:
-                    accepted_answers.extend([clean_answer(ans) for ans in extra_synonyms[word_key]])
-
-                if student in accepted_answers:
-                    st.success("Correct!")
-                    st.session_state.score += 1
-                    result = "Correct"
-                else:
-                    st.error(f"Wrong. Correct answer: {correct_answer}")
-                    result = "Incorrect"
-
-                st.session_state.answers.append({
-                    "word": word,
-                    "your_answer": user_input,
-                    "correct_answer": correct_answer,
-                    "result": result
-                })
-
-                st.session_state.submitted = True
-
-        elif st.button("Next"):
-            st.session_state.current_index += 1
-            st.session_state.submitted = False
+            st.session_state.grammar_index += 1
 
     else:
-        score = st.session_state.score
-        percent = (score / num_words) * 100
+        score = st.session_state.grammar_score
+        total = len(grammar_questions)
+        percent = (score / total) * 100
+        st.success(f"Grammar Quiz Complete! Your score: {score} / {total} ({percent:.0f}%)")
+        if st.button("Restart Grammar Quiz"):
+            st.session_state.grammar_index = 0
+            st.session_state.grammar_score = 0
 
-        # Bilingual feedback
-        if percent >= 90:
-            message = "Excellent work! 🌟 / Ausgezeichnete Arbeit! 🌟"
-        elif percent >= 75:
-            message = "Great job! 👍 / Gute Arbeit! 👍"
-        elif percent >= 50:
-            message = "Good effort, keep practicing! / Gute Mühe, übe weiter!"
+# ==========================
+# VOCABULARY QUIZ SECTION
+# ==========================
+elif mode == "Vocabulary Quiz":
+    level = st.selectbox("Select the level", ["A1", "A2"])
+    vocab_list = a1_vocab if level == "A1" else a2_vocab
+    num_words = st.slider("How many words do you want to answer?", min_value=5, max_value=len(vocab_list), step=1)
+    st.write(f"Total available: {len(vocab_list)}")
+
+    if "quiz_vocab" not in st.session_state or st.session_state.get("level") != level or st.session_state.get("num_words") != num_words:
+        st.session_state.quiz_vocab = random.sample(vocab_list, num_words)
+        st.session_state.current_index = 0
+        st.session_state.score = 0
+        st.session_state.started = False
+        st.session_state.submitted = False
+        st.session_state.answers = []
+        st.session_state.level = level
+        st.session_state.num_words = num_words
+
+    if st.button("Start Quiz") and not st.session_state.started:
+        st.session_state.current_index = 0
+        st.session_state.score = 0
+        st.session_state.started = True
+        st.session_state.submitted = False
+        st.session_state.answers = []
+        st.session_state.quiz_vocab = random.sample(vocab_list, num_words)
+
+    if st.session_state.started:
+        total = len(st.session_state.quiz_vocab)
+        if st.session_state.current_index < total:
+            word, correct_answer = st.session_state.quiz_vocab[st.session_state.current_index]
+            st.progress((st.session_state.current_index + 1) / total)
+            st.subheader(f"Question {st.session_state.current_index + 1} of {total}")
+            st.subheader(f"Translate to English: '{word}'")
+
+            audio_filename = word.replace(" ", "_").replace(".", "").replace("/", "").replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss") + ".mp3"
+            audio_path = f"audio/{audio_filename}"
+            if os.path.exists(audio_path):
+                st.audio(audio_path, format="audio/mp3")
+
+            user_input = st.text_input("Your answer:", key=f"input_{st.session_state.current_index}")
+            if not st.session_state.submitted:
+                if st.button("Submit"):
+                    student = clean_answer(user_input)
+                    correct = clean_answer(correct_answer)
+                    word_key = word.lower().split()[0]
+                    accepted_answers = [correct]
+                    if word_key in extra_synonyms:
+                        accepted_answers.extend([clean_answer(ans) for ans in extra_synonyms[word_key]])
+
+                    if student in accepted_answers:
+                        st.success("Correct!")
+                        st.session_state.score += 1
+                        result = "Correct"
+                    else:
+                        st.error(f"Wrong. Correct answer: {correct_answer}")
+                        result = "Incorrect"
+
+                    st.session_state.answers.append({
+                        "word": word,
+                        "your_answer": user_input,
+                        "correct_answer": correct_answer,
+                        "result": result
+                    })
+
+                    st.session_state.submitted = True
+
+            elif st.button("Next"):
+                st.session_state.current_index += 1
+                st.session_state.submitted = False
         else:
-            message = "Don't give up! Review and try again. / Gib nicht auf! Wiederhole und versuche es erneut."
+            score = st.session_state.score
+            percent = (score / num_words) * 100
+            st.success(f"Quiz complete! Your score: {score} / {num_words} ({percent:.0f}%)")
+            st.subheader("Answer Review")
+            for item in st.session_state.answers:
+                st.write(f"{item['word']}: Your answer: {item['your_answer']} — {item['result']} (Correct: {item['correct_answer']})")
 
-        st.success(f"Quiz complete! Your score: {score} / {num_words} ({percent:.0f}%)")
-        st.info(message)
-
-        st.subheader("Answer Review")
-        for item in st.session_state.answers:
-            st.write(
-                f"{item['word']}: Your answer: {item['your_answer']} — {item['result']} (Correct: {item['correct_answer']})"
-            )
-
-        if st.button("Restart"):
-            st.session_state.started = False
-            st.session_state.quiz_vocab = random.sample(vocab_list, num_words)
-            st.session_state.current_index = 0
-            st.session_state.score = 0
-            st.session_state.submitted = False
-            st.session_state.answers = []
+            if st.button("Restart"):
+                st.session_state.started = False
+                st.session_state.quiz_vocab = random.sample(vocab_list, num_words)
+                st.session_state.current_index = 0
+                st.session_state.score = 0
+                st.session_state.submitted = False
+                st.session_state.answers = []
