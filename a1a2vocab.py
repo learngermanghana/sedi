@@ -10,7 +10,7 @@ st.title("🔐 German Learning App Login")
 
 # ----------------- LOGIN -----------------
 try:
-    codes_df = pd.read_excel("student_codes.xlsx")
+    codes_df = pd.read_csv("student_codes.csv")
     codes_df.columns = codes_df.columns.str.strip().str.lower()
     valid_codes = set(codes_df["code"].astype(str).str.strip().str.lower())
 except Exception:
