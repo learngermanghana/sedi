@@ -114,7 +114,7 @@ def search_grammar_topics(query, grammar_data, level_filter):
     return [e for e in grammar_data if e['level'] in level_filter and any(qk in ak for qk in query_keywords for ak in e.get('keywords',[])+[e['topic'].lower()])]
 
 def show_grammar_ui(grammar_data):
-    level_filter = st.sidebar.multiselect("Select Level(s)", ["A1","A2","B1","B2"], default=["A1","A2","B1","B2"])
+    level_filter = st.sidebar.multiselect("Select Level(s)", ["A1","A2"], default=["A1","A2"])
     query = st.text_input("🔍 Type a grammar question or keyword")
     if query:
         results = search_grammar_topics(query, grammar_data, level_filter)
@@ -503,7 +503,7 @@ elif section == "🏆 Leaderboard":
 # --- German Grammar Helper Section ---
 elif section == "📘 Grammar Helper":
     back_button()
-    st.title("📘 German Grammar Helper: A1–B2")
+    st.title("📘 German Grammar Helper: A1–A2")
     st.markdown("#### Powered by Learn Language Education Academy")
     show_letter_and_essay_samples()
     show_grammar_ui(load_grammar_data())
