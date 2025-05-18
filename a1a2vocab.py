@@ -52,9 +52,9 @@ def back_button():
         if "section_override" in st.session_state:
             del st.session_state["section_override"]
         rerun()
-
-# --- GRAMMAR HELPER FUNCTIONS ---
+        
 def load_grammar_data():
+    return [
         # --- A1 Topics ---
         {"level":"A1","topic":"Word Classes (Wortarten)","keywords":["word classes","wortarten","nouns","verbs","adjectives","adverbs","pronouns","articles","prepositions","conjunctions","numerals","interjections"],"explanation":"German Wortarten categorize words by function (e.g., nouns, verbs, adjectives, adverbs, pronouns, articles, prepositions, conjunctions, numerals, interjections).","example":"Das schnelle Auto fährt sehr laut."},
         {"level":"A1","topic":"Personal Pronouns","keywords":["ich","du","er","sie","es","wir","ihr","Sie"],"explanation":"Pronouns replace nouns: ich (I), du (you). Must match case, number, and gender.","example":"Ich bin Felix."},
@@ -106,20 +106,7 @@ def load_grammar_data():
         {"level":"A2","topic":"Passive Voice (Present)","keywords":["passiv","werden","partizip"],"explanation":"Form passive sentence with werden + Partizip II to focus on the receiver of the action.","example":"Die Pizza wird geliefert."},
         {"level":"A2","topic":"Adverbs of Frequency & Degree","keywords":["oft","manchmal","sehr","kaum"],"explanation":"Use adverbs like oft, manchmal for frequency and sehr, kaum for degree to modify verbs.","example":"Ich bin meistens pünktlich."},
         {"level":"A2","topic":"TMP Rule","keywords":["time","manner","place"],"explanation":"Adverbs and adverbial phrases follow the order: Time - Manner - Place.","example":"Ich lerne heute gerne hier."},
-        {"level":"A2","topic":"Common Connectors","keywords":["deshalb","außerdem","zwar aber"],"explanation":"Link ideas logically with connectors like deshalb, außerdem, zwar … aber.","example":"Ich lerne viel, deshalb verstehe ich besser."},
-
-        # --- B1 Topics ---
-        {"level":"B1","topic":"Simple Past (Präteritum)","keywords":["präteritum","past"],"explanation":"Primarily a written tense; regular verbs add -te, irregular verbs have stem changes.","example":"Ich ging gestern ins Kino."},
-        {"level":"B1","topic":"Pluperfect (Plusquamperfekt)","keywords":["plusquamperfekt"],"explanation":"Describes an action completed before another past action: hatte/war + Partizip II.","example":"Ich hatte gegessen, bevor er kam."},
-        {"level":"B1","topic":"Modal Verbs in Past","keywords":["modalverben","perfekt","müssen"],"explanation":"Combine modal verbs with haben + Partizip II for past necessity or ability.","example":"Ich habe arbeiten müssen."},
-        {"level":"B1","topic":"Advanced Connectors","keywords":["zwar","aber","nicht nur","sondern"],"explanation":"Use advanced linking phrases like zwar … aber and nicht nur … sondern for nuance.","example":"Nicht nur lerne ich Deutsch, sondern ich spreche es täglich."},
-
-        # --- B2 Topics ---
-        {"level":"B2","topic":"Future Perfect (Futur II)","keywords":["futur II","future perfect"],"explanation":"Expresses that an action will have been completed by a future time: werde + Partizip II + sein/haben.","example":"Bis morgen werde ich den Brief geschrieben haben."},
-        {"level":"B2","topic":"Passive Voice in All Tenses","keywords":["passiv","werden","partizip"],"explanation":"Form passive across tenses: Präsens (wird gemacht), Präteritum (wurde gemacht), Perfekt (ist gemacht worden).","example":"Das Buch wird gelesen. Das Buch ist gelesen worden."},
-        {"level":"B2","topic":"Indirect Speech","keywords":["konjunktiv I","indirekte rede"],"explanation":"Report speech using Konjunktiv I for neutrality in reported statements.","example":"Er sagt, er habe Zeit."},
-        {"level":"B2","topic":"Nominal Style","keywords":["nominalstil","nominalisierung"],"explanation":"Convert complex ideas into noun phrases for formal style (Nominalisierung).","example":"Sein Zuspätkommen war ein Problem."},
-        {"level":"B2","topic":"Adverbial Participles","keywords":["partizipialkonstruktion","adverbial"],"explanation":"Use participle phrases to shorten subordinate clauses: Vom Regen überrascht, ging er nach Hause.","example":"Vom Regen überrascht, ging er nach Hause."}
+        {"level":"A2","topic":"Common Connectors","keywords":["deshalb","außerdem","zwar aber"],"explanation":"Link ideas logically with connectors like deshalb, außerdem, zwar … aber.","example":"Ich lerne viel, deshalb verstehe ich besser."}
     ]
 
 def search_grammar_topics(query, grammar_data, level_filter):
