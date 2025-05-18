@@ -1,4 +1,3 @@
-# Stage 0: Imports & App Setup
 import os
 import streamlit as st
 import pandas as pd
@@ -8,14 +7,18 @@ import difflib
 
 st.set_page_config(page_title="German Learning App", page_icon="🇩🇪", layout="centered")
 
-# RERUN HELPER
-# Attempts to rerun Streamlit app; safely ignores if unsupported
+# --- Helper to Rerun ---
 def rerun():
-    try:
-        st.experimental_rerun()
-    except Exception:
-        pass
+    try: st.experimental_rerun()
+    except Exception: pass
 
+# --- Session Reset Helper ---
+def clear_states(*keys):
+    for k in keys:
+        if k in st.session_state:
+            del st.session_state[k]
+
+# --- Load Codes ---
 st.title("🔐 German Learning App Login")
 codes_file_csv = "student_codes.csv"
 codes_file_xlsx = "student_codes.xlsx"
@@ -44,7 +47,12 @@ if student_code not in valid_codes:
 
 st.success(f"✅ Welcome, {student_code}!")
 
-# Stage 2: Dashboard - Module Selection Buttons
+# --- Move Level Selection to Main Page ---
+st.markdown("### Please select your level:")
+level = st.radio("Level:", ["A1", "A2"], index=0 if st.session_state.get("level") == "A1" else 1, key="level", horizontal=True)
+st.session_state["level"] = level
+
+# --- Dashboard Buttons ---
 SCHOOL_NAME = "Learn Language Education Academy"
 st.markdown(f"## 🏫 {SCHOOL_NAME}")
 st.markdown(f"Welcome **{student_code}**! 👋")
@@ -53,48 +61,112 @@ st.subheader("📌 Available Modules")
 cols = st.columns(2)
 with cols[0]:
     if st.button("📚 Start Vocabulary Quiz"):
+        clear_states('vocab_index','vocab_score','vocab_quiz','vocab_feedback')
         st.session_state["section_override"] = "📚 Vocabulary Quiz"
         rerun()
     if st.button("🧪 Start Grammar Quiz"):
+        clear_states('gq')
         st.session_state["section_override"] = "🧪 Grammar Quiz"
         rerun()
 with cols[1]:
     if st.button("✍️ Start Sentence Trainer"):
+        clear_states('sent_index','sent_feedback','sent_correct')
         st.session_state["section_override"] = "✍️ Sentence Trainer"
         rerun()
     if st.button("🔢 Start Grammar Practice"):
         st.session_state["section_override"] = "🔢 Grammar Practice"
         rerun()
 
-# Stage 3: Sidebar Navigation
+# --- Sidebar Info ---
 st.sidebar.title("🇩🇪 German Training Center")
-# persistable level selector with unique key
-try:
-    level = st.sidebar.selectbox(
-        "Select your level:", ["A1", "A2"], key="level_select"
-    )
-except Exception:
-    level = st.sidebar.selectbox(
-        "Select your level:", ["A1", "A2"]
-    )
+st.sidebar.info("Tip: You can change your level at the top of the main page. If you don't see your modules, scroll up!")
 
-# Preserve any override from dashboard buttons
+# --- Section Selection ---
 if "section_override" in st.session_state:
     section = st.session_state["section_override"]
 else:
     if level == "A1":
-        section = st.sidebar.radio(
+        section = st.radio(
             "Choose a topic:",
             ["📚 Vocabulary Quiz", "✍️ Sentence Trainer", "🔢 Grammar Practice"],
             key="topic_a1"
         )
     else:
-        section = st.sidebar.radio(
+        section = st.radio(
             "Choose a topic:",
             ["📚 Vocabulary Quiz", "✍️ Sentence Trainer", "🧪 Grammar Quiz", "🔢 Grammar Practice"],
             key="topic_a2"
         )
 
+# --- Add Back Button in Each Module ---
+def back_button():
+    if st.button("⬅️ Back to Dashboard"):
+        if "section_override" in st.session_state:
+            del st.session_state["section_override"]
+        rerun()
+
+# --- Vocabulary Lists ---
+# (Use your same vocab lists as before)
+# ... [Paste your a1_vocab and a2_vocab lists here] ...
+
+# For brevity, I'll show only the module start/stop and not paste the full vocab lists again.
+# You can insert your a1_vocab and a2_vocab here as before!
+
+# --- Vocabulary Quiz ---
+if section == "📚 Vocabulary Quiz":
+    back_button()
+    st.title("📚 Vocabulary Quiz")
+    vocab_list = a1_vocab if level == "A1" else a2_vocab
+    total = len(vocab_list)
+
+    if "vocab_length" not in st.session_state:
+        st.session_state.vocab_length = min(5, total)
+    if "vocab_index" not in st.session_state:
+        st.markdown(f"Total available words: **{total}**")
+        col1, col2, col3 = st.columns([1,2,1])
+        with col1:
+            if st.button("➖"): st.session_state.vocab_length = max(3, st.session_state.vocab_length-1)
+        with col3:
+            if st.button("➕"): st.session_state.vocab_length = min(total, st.session_state.vocab_length+1)
+        with col2:
+            st.write(f"**Questions:** {st.session_state.vocab_length}")
+
+        if st.checkbox("🔍 Preview all vocabulary words"):
+            for w,m in vocab_list: st.write(f"- **{w}** → {m}")
+
+        if st.button("🚀 Start Quiz"):
+            st.session_state.vocab_index = 0
+            st.session_state.vocab_score = 0
+            st.session_state.vocab_quiz = random.sample(vocab_list, st.session_state.vocab_length)
+            st.session_state.vocab_feedback = False
+            rerun()
+    else:
+        idx = st.session_state.vocab_index
+        quiz = st.session_state.vocab_quiz
+        if idx < len(quiz):
+            word, answer = quiz[idx]
+            st.markdown(f"### {idx+1}. Meaning of **{word}**?")
+            inp = st.text_input("Your answer:", key=f"vocab_{idx}")
+            if not st.session_state.vocab_feedback and st.button("✅ Submit"):
+                clean = lambda s: re.sub(r"[^a-zA-Z]","",s.lower())
+                if clean(inp)==clean(answer):
+                    st.success("✅ Correct!")
+                    st.session_state.vocab_score += 1
+                else:
+                    st.error(f"❌ Incorrect. Correct: {answer}")
+                st.session_state.vocab_feedback = True
+            elif st.session_state.vocab_feedback and st.button("➡ Next"):
+                st.session_state.vocab_index += 1
+                st.session_state.vocab_feedback = False
+                rerun()
+        else:
+            score = st.session_state.vocab_score
+            total_q = len(st.session_state.vocab_quiz)
+            st.success(f"🎉 Quiz Complete! {score}/{total_q} ({score/total_q*100:.0f}%)")
+            if st.button("⬅️ Back to Dashboard"):
+                del st.session_state["section_override"]
+                rerun()
+                
 # Stage 4: Vocabulary Lists
 # A1 Vocabulary
 a1_vocab = [
