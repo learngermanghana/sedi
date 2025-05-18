@@ -135,10 +135,8 @@ def show_letter_and_essay_samples():
     samples = {
         "A1": {"intro":"Sehr geehrte Damen und Herren, ich hoffe, es geht Ihnen gut.","body":"Ich möchte einen Termin vereinbaren. Bitte teilen Sie mir mögliche Zeiten mit.","conclusion":"Ich freue mich im Voraus auf Ihre Rückmeldung. Mit freundlichen Grüßen, [Ihr Name]"},
         "A2": {"intro":"Hallo [Name], vielen Dank für deine Nachricht.","body":"Ich interessiere mich für Ihre Wohnung. Ist sie noch verfügbar?","conclusion":"Ich freue mich auf Ihre Antwort. Viele Grüße, [Ihr Name]"},
-        "B1": {"intro":"Heutzutage ist das Thema Lernen ein wichtiges Thema in unserem Leben.","body":"Ich bin der Meinung, dass Lernen sehr wichtig ist, weil es uns hilft, unser Wissen zu erweitern. Einerseits gibt es viele Vorteile. Zum Beispiel hilft uns das Lernen mit Apps, flexibler und schneller zu lernen.","conclusion":"Abschließend lässt sich sagen, dass Lernen mit neuen Methoden sehr nützlich ist, auch wenn es manchmal herausfordernd sein kann."},
-        "B2": {"intro":"In der heutigen digitalen Ära spielt Social Media eine zentrale Rolle in unserem Alltag.","body":"Während es die Kommunikation erleichtert, kann es auch zu Ablenkung und oberflächlichen Interaktionen führen.","conclusion":"Letztendlich hängt der Nutzen von Social Media von bewusster Nutzung ab."}
     }
-    levels = st.sidebar.multiselect("Show Letters/Essays for:", ["A1","A2","B1","B2"], default=["A1","A2","B1","B2"])
+    levels = st.sidebar.multiselect("Show Letters/Essays for:", ["A1","A2"], default=["A1","A2"])
     if st.sidebar.checkbox("📬 Show Letter Samples"):
         st.subheader("📬 Letter Samples")
         for lvl in levels:
