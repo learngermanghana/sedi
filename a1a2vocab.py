@@ -445,41 +445,38 @@ def main():
     st.set_page_config(page_title="Inventory App", page_icon="📦", layout="wide")
     init_db()
 
-    with st.sidebar:
-        st.title("📦 Inventory")
-        page = st.radio(
-            "Navigate",
-            (
-                "Dashboard",
-                "Items",
-                "Suppliers",
-                "Receive",
-                "Issue",
-                "Adjustments",
-                "Movements",
-                "Settings",
-            ),
-        )
-        st.markdown("---")
-        st.caption("Data stored in data.db")
+    st.title("📦 Inventory")
+    st.caption("Data stored in data.db · Use the tabs below to navigate")
 
-    if page == "Dashboard":
+    tabs = st.tabs([
+        "Dashboard",
+        "Items",
+        "Suppliers",
+        "Receive",
+        "Issue",
+        "Adjustments",
+        "Movements",
+        "Settings",
+    ])
+
+    with tabs[0]:
         page_dashboard()
-    elif page == "Items":
+    with tabs[1]:
         page_items()
-    elif page == "Suppliers":
+    with tabs[2]:
         page_suppliers()
-    elif page == "Receive":
+    with tabs[3]:
         page_receive()
-    elif page == "Issue":
+    with tabs[4]:
         page_issue()
-    elif page == "Adjustments":
+    with tabs[5]:
         page_adjustments()
-    elif page == "Movements":
+    with tabs[6]:
         page_movements()
-    elif page == "Settings":
+    with tabs[7]:
         page_settings()
 
 
 if __name__ == "__main__":
+    main()
     main()
