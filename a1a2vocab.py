@@ -244,32 +244,32 @@ def page_items():
     suppliers = df_suppliers()
 
     with st.expander("➕ Create / Edit item", expanded=True):
-        edit_mode = st.checkbox("Edit existing item")
+        edit_mode = st.checkbox("Edit existing item", key="items_edit")
         item_to_edit = None
         if edit_mode and not items.empty:
-            item_to_edit = st.selectbox("Select item", items["name"], index=None)
+            item_to_edit = st.selectbox("Select item", items["name"], index=None, key="items_select")
             if item_to_edit:
                 row = items.loc[items["name"] == item_to_edit].iloc[0]
         else:
             row = None
 
-        sku = st.text_input("SKU", value=(row["sku"] if row is not None else "")).strip()
-        name = st.text_input("Name", value=(row["name"] if row is not None else "")).strip()
-        unit = st.text_input("Unit", value=(row["unit"] if row is not None else "pcs")).strip()
-        cost = st.number_input("Cost", min_value=0.0, value=float(row["cost"]) if row is not None else 0.0, step=0.01)
-        price = st.number_input("Price", min_value=0.0, value=float(row["price"]) if row is not None else 0.0, step=0.01)
-        min_stock = st.number_input("Min stock", min_value=0.0, value=float(row["min_stock"]) if row is not None else 0.0, step=1.0)
-        category = st.text_input("Category", value=(row["category"] if row is not None else ""))
+        sku = st.text_input("SKU", value=(row["sku"] if row is not None else ""), key="items_sku").strip()
+        name = st.text_input("Name", value=(row["name"] if row is not None else ""), key="items_name").strip()
+        unit = st.text_input("Unit", value=(row["unit"] if row is not None else "pcs"), key="items_unit").strip()
+        cost = st.number_input("Cost", min_value=0.0, value=float(row["cost"]) if row is not None else 0.0, step=0.01, key="items_cost")
+        price = st.number_input("Price", min_value=0.0, value=float(row["price"]) if row is not None else 0.0, step=0.01, key="items_price")
+        min_stock = st.number_input("Min stock", min_value=0.0, value=float(row["min_stock"]) if row is not None else 0.0, step=1.0, key="items_min_stock")
+        category = st.text_input("Category", value=(row["category"] if row is not None else ""), key="items_category")
 
         supplier_display = ["—"] + (suppliers["name"].tolist() if not suppliers.empty else [])
-        supplier_choice = st.selectbox("Default supplier", supplier_display, index=0)
+        supplier_choice = st.selectbox("Default supplier", supplier_display, index=0, key="items_supplier")
         default_supplier_id = None
         if supplier_choice != "—" and not suppliers.empty:
             default_supplier_id = int(suppliers.loc[suppliers["name"] == supplier_choice, "id"].iloc[0])
 
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Save item", use_container_width=True, type="primary"):
+            if st.button("Save item", use_container_width=True, type="primary", key="items_save"):
                 if not sku or not name:
                     st.error("SKU and Name are required.")
                 else:
@@ -280,7 +280,7 @@ def page_items():
                     except sqlite3.IntegrityError as e:
                         st.error(f"Error: {e}")
         with c2:
-            if row is not None and st.button("Delete item", use_container_width=True):
+            if row is not None and st.button("Delete item", use_container_width=True, key="items_delete"):
                 delete_item(int(row["id"]))
                 success_rerun("Item deleted")
 
@@ -300,23 +300,23 @@ def page_suppliers():
     suppliers = df_suppliers()
 
     with st.expander("➕ Create / Edit supplier", expanded=True):
-        edit_mode = st.checkbox("Edit existing supplier")
+        edit_mode = st.checkbox("Edit existing supplier", key="sup_edit")
         sup_to_edit = None
         if edit_mode and not suppliers.empty:
-            sup_to_edit = st.selectbox("Select supplier", suppliers["name"], index=None)
+            sup_to_edit = st.selectbox("Select supplier", suppliers["name"], index=None, key="sup_select")
             if sup_to_edit:
                 row = suppliers.loc[suppliers["name"] == sup_to_edit].iloc[0]
         else:
             row = None
 
-        name = st.text_input("Name", value=(row["name"] if row is not None else "")).strip()
-        email = st.text_input("Email", value=(row["email"] if row is not None else "")).strip()
-        phone = st.text_input("Phone", value=(row["phone"] if row is not None else "")).strip()
-        address = st.text_area("Address", value=(row["address"] if row is not None else "").strip())
+        name = st.text_input("Name", value=(row["name"] if row is not None else ""), key="sup_name").strip()
+        email = st.text_input("Email", value=(row["email"] if row is not None else ""), key="sup_email").strip()
+        phone = st.text_input("Phone", value=(row["phone"] if row is not None else ""), key="sup_phone").strip()
+        address = st.text_area("Address", value=(row["address"] if row is not None else "").strip(), key="sup_address")
 
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Save supplier", type="primary", use_container_width=True):
+            if st.button("Save supplier", type="primary", use_container_width=True, key="sup_save"):
                 if not name:
                     st.error("Name is required.")
                 else:
@@ -324,7 +324,7 @@ def page_suppliers():
                     upsert_supplier(supplier_id, name, email, phone, address)
                     success_rerun("Supplier saved")
         with c2:
-            if row is not None and st.button("Delete supplier", use_container_width=True):
+            if row is not None and st.button("Delete supplier", use_container_width=True, key="sup_delete"):
                 delete_supplier(int(row["id"]))
                 success_rerun("Supplier deleted")
 
@@ -339,24 +339,26 @@ def page_suppliers():
 
 
 def movement_form(type_: str):
+    # Use unique keys to avoid DuplicateElementId when tabs render all pages.
+    pfx = f"{type_}_"
     items = df_items()
     if items.empty:
         st.warning("Create items first.")
         return
 
-    item_name = st.selectbox("Item", items["name"], index=None)
+    item_name = st.selectbox("Item", items["name"], index=None, key=pfx + "item")
     if not item_name:
         return
     row = items.loc[items["name"] == item_name].iloc[0]
     item_id = int(row["id"])
 
     if type_ == "receive":
-        qty = st.number_input("Quantity received", min_value=0.0, step=1.0)
-        unit_cost = st.number_input("Unit cost", min_value=0.0, step=0.01, value=float(row["cost"]))
-        ref = st.text_input("Reference / Invoice #")
-        note = st.text_area("Note")
-        moved_at = st.date_input("Date", value=datetime.today()).isoformat()
-        if st.button("Record receipt", type="primary"):
+        qty = st.number_input("Quantity received", min_value=0.0, step=1.0, key=pfx + "qty")
+        unit_cost = st.number_input("Unit cost", min_value=0.0, step=0.01, value=float(row["cost"]), key=pfx + "unit_cost")
+        ref = st.text_input("Reference / Invoice #", key=pfx + "ref")
+        note = st.text_area("Note", key=pfx + "note")
+        moved_at = st.date_input("Date", value=datetime.today(), key=pfx + "date").isoformat()
+        if st.button("Record receipt", type="primary", key=pfx + "btn"):
             if qty <= 0:
                 st.error("Quantity must be greater than 0")
             else:
@@ -366,12 +368,12 @@ def movement_form(type_: str):
     elif type_ == "issue":
         on_hand = stock_on_hand(item_id)
         st.info(f"On hand: {on_hand} {row['unit']}")
-        qty = st.number_input("Quantity issued", min_value=0.0, step=1.0)
+        qty = st.number_input("Quantity issued", min_value=0.0, step=1.0, key=pfx + "qty")
         unit_cost = None
-        ref = st.text_input("Reference / Order #")
-        note = st.text_area("Note")
-        moved_at = st.date_input("Date", value=datetime.today()).isoformat()
-        if st.button("Record issue", type="primary"):
+        ref = st.text_input("Reference / Order #", key=pfx + "ref")
+        note = st.text_area("Note", key=pfx + "note")
+        moved_at = st.date_input("Date", value=datetime.today(), key=pfx + "date").isoformat()
+        if st.button("Record issue", type="primary", key=pfx + "btn"):
             if qty <= 0:
                 st.error("Quantity must be greater than 0")
             elif qty > on_hand:
@@ -385,13 +387,13 @@ def movement_form(type_: str):
     elif type_ == "adjust":
         on_hand = stock_on_hand(item_id)
         st.info(f"Current on hand: {on_hand} {row['unit']}")
-        desired = st.number_input("New counted quantity", min_value=0.0, step=1.0, value=on_hand)
+        desired = st.number_input("New counted quantity", min_value=0.0, step=1.0, value=on_hand, key=pfx + "desired")
         delta = desired - on_hand
         st.caption(f"Adjustment delta: {delta}")
-        ref = st.text_input("Reference")
-        note = st.text_area("Reason / Note")
-        moved_at = st.date_input("Date", value=datetime.today()).isoformat()
-        if st.button("Record adjustment", type="primary"):
+        ref = st.text_input("Reference", key=pfx + "ref")
+        note = st.text_area("Reason / Note", key=pfx + "note")
+        moved_at = st.date_input("Date", value=datetime.today(), key=pfx + "date").isoformat()
+        if st.button("Record adjustment", type="primary", key=pfx + "btn"):
             if delta == 0:
                 st.info("No change needed.")
             else:
@@ -399,7 +401,7 @@ def movement_form(type_: str):
                 success_rerun("Adjustment recorded")
 
 
-def page_receive():
+def page_receive():():
     page_header("Receive Stock", "Add inventory coming in")
     movement_form("receive")
 
