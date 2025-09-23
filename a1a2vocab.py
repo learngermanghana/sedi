@@ -1,3 +1,4 @@
+
 import streamlit as st
 import sqlite3
 import pandas as pd
@@ -21,7 +22,7 @@ def init_db():
     cur = conn.cursor()
 
     cur.execute(
-        """
+        '''
         CREATE TABLE IF NOT EXISTS items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sku TEXT UNIQUE NOT NULL,
@@ -35,11 +36,11 @@ def init_db():
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
-        """
+        '''
     )
 
     cur.execute(
-        """
+        '''
         CREATE TABLE IF NOT EXISTS suppliers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -49,11 +50,11 @@ def init_db():
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
-        """
+        '''
     )
 
     cur.execute(
-        """
+        '''
         CREATE TABLE IF NOT EXISTS movements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             item_id INTEGER NOT NULL,
@@ -68,7 +69,7 @@ def init_db():
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(item_id) REFERENCES items(id)
         )
-        """
+        '''
     )
 
     conn.commit()
@@ -84,19 +85,19 @@ def upsert_item(item_id: Optional[int], sku, name, unit, cost, price, min_stock,
     now = datetime.utcnow().isoformat()
     if item_id:
         cur.execute(
-            """
+            '''
             UPDATE items
             SET sku=?, name=?, unit=?, cost=?, price=?, min_stock=?, category=?, default_supplier_id=?, updated_at=?
             WHERE id=?
-            """,
+            ''',
             (sku, name, unit, cost, price, min_stock, category, default_supplier_id, now, item_id),
         )
     else:
         cur.execute(
-            """
+            '''
             INSERT INTO items (sku, name, unit, cost, price, min_stock, category, default_supplier_id, created_at, updated_at)
             VALUES (?,?,?,?,?,?,?,?,?,?)
-            """,
+            ''',
             (sku, name, unit, cost, price, min_stock, category, default_supplier_id, now, now),
         )
     conn.commit()
@@ -114,19 +115,19 @@ def upsert_supplier(supplier_id: Optional[int], name, email, phone, address):
     now = datetime.utcnow().isoformat()
     if supplier_id:
         cur.execute(
-            """
+            '''
             UPDATE suppliers
             SET name=?, email=?, phone=?, address=?, updated_at=?
             WHERE id=?
-            """,
+            ''',
             (name, email, phone, address, now, supplier_id),
         )
     else:
         cur.execute(
-            """
+            '''
             INSERT INTO suppliers (name, email, phone, address, created_at, updated_at)
             VALUES (?,?,?,?,?,?)
-            """,
+            ''',
             (name, email, phone, address, now, now),
         )
     conn.commit()
@@ -141,10 +142,10 @@ def delete_supplier(supplier_id: int):
 def record_movement(item_id: int, type_: str, qty: float, unit_cost: Optional[float], ref: str, note: str, from_loc: Optional[str], to_loc: Optional[str], moved_at: str):
     conn = get_conn()
     conn.execute(
-        """
+        '''
         INSERT INTO movements (item_id, type, qty, unit_cost, ref, note, from_location, to_location, moved_at)
         VALUES (?,?,?,?,?,?,?,?,?)
-        """,
+        ''',
         (item_id, type_, qty, unit_cost, ref, note, from_loc, to_loc, moved_at),
     )
     conn.commit()
@@ -160,13 +161,13 @@ def df_suppliers() -> pd.DataFrame:
 
 def df_movements() -> pd.DataFrame:
     return pd.read_sql_query(
-        """
+        '''
         SELECT m.id, m.moved_at, m.type, i.sku, i.name as item_name, m.qty, m.unit_cost, m.ref, m.note,
                m.from_location, m.to_location
         FROM movements m
         JOIN items i ON i.id = m.item_id
         ORDER BY m.moved_at DESC, m.id DESC
-        """,
+        ''',
         get_conn(),
     )
 
@@ -401,7 +402,7 @@ def movement_form(type_: str):
                 success_rerun("Adjustment recorded")
 
 
-def page_receive():():
+def page_receive():
     page_header("Receive Stock", "Add inventory coming in")
     movement_form("receive")
 
@@ -429,14 +430,7 @@ def page_movements():
 def page_settings():
     page_header("Settings", "General configuration")
     st.write("This minimal MVP stores data in a local SQLite file (`data.db`). For multi-user cloud use, switch to a hosted DB like Supabase or Postgres and add authentication.")
-    st.code(
-        """
-        # Example: connect to Postgres instead of SQLite
-        import psycopg2
-        conn = psycopg2.connect(dsn_from_streamlit_secrets)
-        """,
-        language="python",
-    )
+    st.code('# Example: connect to Postgres instead of SQLite\nimport psycopg2\nconn = psycopg2.connect(dsn_from_streamlit_secrets)', language="python")
 
 
 # -------------------------------
@@ -480,5 +474,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
     main()
