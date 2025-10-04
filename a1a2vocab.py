@@ -120,12 +120,14 @@ def auth_screen():
                 st.error("Invalid email or password.")
                 st.stop()
 
-            st.session_state["user"] = {"id": sess.user.id, "email": email_l}
             memberships = get_user_orgs(sess.user.id)
             if not memberships:
+                for k in ("user", "org_id", "role"):
+                    st.session_state.pop(k, None)
                 st.warning("No organization yet. Use 'Create store' first.")
                 st.stop()
 
+            st.session_state["user"] = {"id": sess.user.id, "email": email_l}
             st.session_state["org_id"] = memberships[0]["org_id"]
             st.session_state["role"] = memberships[0]["role"]
             st.rerun()
@@ -361,6 +363,12 @@ def page_settings():
 # -------------------------------
 def main():
     if "user" not in st.session_state:
+        auth_screen()
+        return
+
+    if "org_id" not in st.session_state:
+        for k in ("user", "org_id", "role"):
+            st.session_state.pop(k, None)
         auth_screen()
         return
 
