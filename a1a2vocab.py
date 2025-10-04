@@ -217,7 +217,6 @@ def list_sales(org_id: str) -> pd.DataFrame:
 
 def create_store_for_logged_in_user(store_name: str):
     uid = st.session_state["user"]["id"]
-    set_token(st.session_state.get("jwt"))
     org = sb.table("orgs").insert({"name": store_name}).execute()  # <-- only 'name'
     org_id = org.data[0]["id"]
     sb.table("org_members").insert({
