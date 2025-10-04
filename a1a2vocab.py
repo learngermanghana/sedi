@@ -1,4 +1,4 @@
-# streamlit_app.py — Supabase version (multi-tenant, fixed)
+# streamlit_app.py — Supabase multi-tenant inventory (with proper JWT session)
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date
@@ -8,43 +8,57 @@ from supabase import create_client, Client
 # Setup
 # -------------------------------
 st.set_page_config(page_title="Inventory (Supabase)", page_icon="📦", layout="wide")
+
 url = st.secrets["SUPABASE_URL"]
 key = st.secrets["SUPABASE_ANON_KEY"]
 sb: Client = create_client(url, key)
 
 MIN_PASSWORD_LENGTH = 6
 
-# attach/detach JWT for PostgREST so RLS sees the user
-def set_token(token: str | None):
-    sb.postgrest.auth(token if token else None)
-
-# reattach stored token on every run
-if "jwt" in st.session_state:
-    set_token(st.session_state["jwt"])
-
 # -------------------------------
-# Small helpers
+# Session helpers (ensure PostgREST uses user JWT)
 # -------------------------------
+def attach_tokens(access: str | None, refresh: str | None):
+    if access and refresh:
+        sb.auth.set_session(access_token=access, refresh_token=refresh)
+        sb.postgrest.auth(access)
+    else:
+        sb.postgrest.auth(None)
+
+def reattach_session():
+    access = st.session_state.get("jwt")
+    refresh = st.session_state.get("rt")
+    attach_tokens(access, refresh)
+
+reattach_session()  # run on every script execution
+
+def logout():
+    for k in ("user", "jwt", "rt", "org_id", "role"):
+        st.session_state.pop(k, None)
+    attach_tokens(None, None)
+    st.rerun()
+
 def success_rerun(msg: str):
     st.success(msg)
     st.rerun()
 
-def logout():
-    for k in ("user", "jwt", "org_id", "role"):
-        st.session_state.pop(k, None)
-    st.rerun()
-
+# -------------------------------
+# Org & membership
+# -------------------------------
 def get_user_orgs(user_id: str):
     res = sb.table("org_members").select("org_id, role").eq("user_id", user_id).execute()
     return res.data or []
 
 def create_store_for_logged_in_user(store_name: str) -> str:
-    """Create org row (name only) then membership as owner for the current user."""
-    uid = st.session_state["user"]["id"]
-    set_token(st.session_state.get("jwt"))  # ensure authenticated for RLS
+    """Creates org (name only) + membership(owner) using current user JWT."""
+    # must be logged-in + tokens attached
     org = sb.table("orgs").insert({"name": store_name}).execute()
     org_id = org.data[0]["id"]
-    sb.table("org_members").insert({"user_id": uid, "org_id": org_id, "role": "owner"}).execute()
+    sb.table("org_members").insert({
+        "user_id": st.session_state["user"]["id"],
+        "org_id": org_id,
+        "role": "owner"
+    }).execute()
     return org_id
 
 # -------------------------------
@@ -52,10 +66,11 @@ def create_store_for_logged_in_user(store_name: str) -> str:
 # -------------------------------
 def auth_screen():
     st.title("📦 Inventory (Supabase)")
-    st.caption("Sign up to create a store, or log in to manage your inventory.")
+    st.caption("Create a store or log in.")
+
     tab_login, tab_signup = st.tabs(["Log in", "Create store"])
 
-    # ---------- SIGN UP ----------
+    # --- SIGN UP ---
     with tab_signup:
         store = st.text_input("Store name")
         email = st.text_input("Owner email")
@@ -63,34 +78,37 @@ def auth_screen():
         if st.button("Create my store", type="primary", use_container_width=True):
             if not (store and email and pw):
                 st.error("All fields required.")
-            elif len(pw) < MIN_PASSWORD_LENGTH:
+                st.stop()
+            if len(pw) < MIN_PASSWORD_LENGTH:
                 st.error(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
-            else:
-                # 1) create auth user
-                out = sb.auth.sign_up({"email": email, "password": pw})
-                if not out.user:
-                    st.error("Sign-up failed (email may exist or confirmation required).")
-                    st.stop()
+                st.stop()
 
-                # 2) sign in to get a session/JWT for RLS-protected inserts
-                sess = sb.auth.sign_in_with_password({"email": email, "password": pw})
-                if not sess.user:
-                    st.error("Auto-login failed after sign-up (confirm email or disable confirmations).")
-                    st.stop()
+            # 1) sign up
+            out = sb.auth.sign_up({"email": email, "password": pw})
+            if not out.user:
+                st.error("Sign-up failed (email may exist or confirmation required).")
+                st.stop()
 
-                # 3) attach JWT so inserts run as the user
-                st.session_state["user"] = {"id": sess.user.id, "email": email}
-                st.session_state["jwt"] = sess.session.access_token
-                set_token(st.session_state["jwt"])
+            # 2) sign in to get session/JWT
+            sess = sb.auth.sign_in_with_password({"email": email, "password": pw})
+            if not sess.user:
+                st.error("Auto-login failed after sign-up (confirm email or disable confirmations).")
+                st.stop()
 
-                # 4) create org + membership (NO owner_id column)
-                try:
-                    _ = create_store_for_logged_in_user(store)
-                    st.success("Store created. Please log in on the Log in tab.")
-                except Exception as e:
-                    st.error(f"Setup failed: {e}")
+            # 3) store tokens and attach
+            st.session_state["user"] = {"id": sess.user.id, "email": email}
+            st.session_state["jwt"] = sess.session.access_token
+            st.session_state["rt"] = sess.session.refresh_token
+            attach_tokens(st.session_state["jwt"], st.session_state["rt"])
 
-    # ---------- LOG IN ----------
+            # 4) create org + membership
+            try:
+                _ = create_store_for_logged_in_user(store)
+                st.success("Store created. Please log in on the Log in tab.")
+            except Exception as e:
+                st.error(f"Setup failed: {e}")
+
+    # --- LOG IN ---
     with tab_login:
         email_l = st.text_input("Email", key="login_email")
         pw_l = st.text_input("Password", type="password", key="login_pw")
@@ -100,10 +118,11 @@ def auth_screen():
                 st.error("Invalid email or password.")
                 st.stop()
 
-            # save user + JWT and attach
+            # keep session + attach tokens
             st.session_state["user"] = {"id": sess.user.id, "email": email_l}
             st.session_state["jwt"] = sess.session.access_token
-            set_token(st.session_state["jwt"])
+            st.session_state["rt"] = sess.session.refresh_token
+            attach_tokens(st.session_state["jwt"], st.session_state["rt"])
 
             memberships = get_user_orgs(sess.user.id)
             if not memberships:
@@ -134,9 +153,14 @@ def list_products(org_id: str) -> pd.DataFrame:
 def upsert_product(org_id: str, pid: str | None, sku, name, category, unit, unit_cost, price, min_stock):
     now = datetime.utcnow().isoformat()
     data = {
-        "org_id": org_id, "sku": sku, "name": name, "category": (category or None),
-        "unit": (unit or "pcs"), "unit_cost": float(unit_cost or 0),
-        "price": float(price or 0), "min_stock": float(min_stock or 0),
+        "org_id": org_id,
+        "sku": sku,
+        "name": name,
+        "category": (category or None),
+        "unit": (unit or "pcs"),
+        "unit_cost": float(unit_cost or 0),
+        "price": float(price or 0),
+        "min_stock": float(min_stock or 0),
         "updated_at": now,
     }
     if pid:
@@ -230,7 +254,8 @@ def page_products():
         c1, c2 = st.columns(2)
         with c1:
             if st.button("Save product", type="primary", use_container_width=True):
-                if not sku or not name: st.error("SKU and Name are required.")
+                if not sku or not name:
+                    st.error("SKU and Name are required.")
                 else:
                     pid = row["id"] if row is not None else None
                     upsert_product(org_id, pid, sku, name, category, unit, unit_cost, price, min_stock)
@@ -250,7 +275,7 @@ def page_receive():
     prods = list_products(org_id)
     if prods.empty: st.info("Add products first."); return
     prods["display"] = prods["sku"] + " — " + prods["name"]
-    sel = st.selectbox("Product", prods["display"], index=None); 
+    sel = st.selectbox("Product", prods["display"], index=None)
     if not sel: return
     row = prods.loc[prods["display"] == sel].iloc[0]
     qty = st.number_input("Quantity received", min_value=0.0, step=1.0)
@@ -265,7 +290,7 @@ def page_sell():
     stock = get_stock_df(org_id)
     if stock.empty: st.info("Add products first."); return
     stock["display"] = stock["sku"] + " — " + stock["name"] + "  (on hand: " + stock["qty"].astype(str) + ")"
-    sel = st.selectbox("Product", stock["display"], index=None); 
+    sel = st.selectbox("Product", stock["display"], index=None)
     if not sel: return
     row = stock.loc[stock["display"] == sel].iloc[0]
     st.info(f"On hand: {row['qty']} {row['unit']}")
@@ -282,7 +307,7 @@ def page_adjust():
     stock = get_stock_df(org_id)
     if stock.empty: st.info("Add products first."); return
     stock["display"] = stock["sku"] + " — " + stock["name"] + "  (current: " + stock["qty"].astype(str) + ")"
-    sel = st.selectbox("Product", stock["display"], index=None); 
+    sel = st.selectbox("Product", stock["display"], index=None)
     if not sel: return
     row = stock.loc[stock["display"] == sel].iloc[0]
     st.info(f"Current on hand: {row['qty']} {row['unit']}")
@@ -311,7 +336,8 @@ def page_settings():
 # Main
 # -------------------------------
 def main():
-    if "user" not in st.session_state or "org_id" not in st.session_state:
+    # If not logged in or no org yet, show auth screen
+    if "user" not in st.session_state or ("org_id" not in st.session_state):
         auth_screen(); return
 
     st.sidebar.success("Signed in")
