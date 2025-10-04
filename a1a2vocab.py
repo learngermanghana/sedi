@@ -1,7 +1,7 @@
-# streamlit_app.py — Supabase multi-tenant inventory (with proper JWT session)
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date
+from typing import Optional, List, Dict
 from supabase import create_client, Client
 
 # -------------------------------
@@ -9,78 +9,34 @@ from supabase import create_client, Client
 # -------------------------------
 st.set_page_config(page_title="Inventory (Supabase)", page_icon="📦", layout="wide")
 
-url = st.secrets["SUPABASE_URL"]
-key = st.secrets["SUPABASE_ANON_KEY"]
+url = st.secrets.get("SUPABASE_URL", "")
+key = st.secrets.get("SUPABASE_ANON_KEY", "")
 sb: Client = create_client(url, key)
 
 MIN_PASSWORD_LENGTH = 6
 
-# ---- Session helpers (replace your existing versions) ----
-
-def attach_session(sess):
-    # store tokens
-    access = sess.session.access_token
-    refresh = sess.session.refresh_token
-    st.session_state["user"] = {"id": sess.user.id, "email": sess.user.email}
-    st.session_state["jwt"] = access
-    st.session_state["rt"]  = refresh
-    # attach to both auth + postgrest (ONLY if we have tokens)
-    sb.auth.set_session(access_token=access, refresh_token=refresh)
-    sb.postgrest.auth(access)  # <-- no None
-
-def reattach_session():
-    access = st.session_state.get("jwt")
-    refresh = st.session_state.get("rt")
-    if access and refresh:
-        sb.auth.set_session(access_token=access, refresh_token=refresh)
-        sb.postgrest.auth(access)  # <-- only when token exists
-
-# call once near top (after creating sb):
-reattach_session()
-
-def logout():
-    # just clear state; don't call postgrest.auth(None)
-    for k in ("user", "jwt", "rt", "org_id", "role"):
-        st.session_state.pop(k, None)
-    st.rerun()
-
-def attach_tokens(access: str, refresh: str):
-    # tokens are already in session_state before this is called
-    sb.auth.set_session(access_token=access, refresh_token=refresh)
-    sb.postgrest.auth(access)
-
-def success_rerun(msg: str):
-    st.success(msg)
-    st.rerun()
-
-
-
 # -------------------------------
-# Org & membership
+# Diagnostics & helpers
 # -------------------------------
-def get_user_orgs(user_id: str):
-    res = sb.table("org_members").select("org_id, role").eq("user_id", user_id).execute()
-    return res.data or []
-
-def create_store_for_logged_in_user(store_name: str) -> str:
-    """Creates org (name only) + membership(owner) using current user JWT."""
-    # must be logged-in + tokens attached
-    org = sb.table("orgs").insert({"name": store_name}).execute()
-    org_id = org.data[0]["id"]
-    sb.table("org_members").insert({
-        "user_id": st.session_state["user"]["id"],
-        "org_id": org_id,
-        "role": "owner"
-    }).execute()
-    return org_id
+def validate_config():
+    """Basic sanity checks for Supabase config before doing any network calls."""
+    problems = []
+    if not url or ".supabase.co" not in url:
+        problems.append("❌ `SUPABASE_URL` is missing or looks incorrect.")
+    if not key or len(key) < 20:
+        problems.append("❌ `SUPABASE_ANON_KEY` is missing or too short.")
+    if problems:
+        for p in problems:
+            st.error(p)
+        st.stop()
 
 def show_supabase_error(stage: str, err: Exception):
-    # Try to extract useful fields from Supabase auth exceptions
+    """Surface useful fields from Supabase exceptions inside Streamlit."""
     parts = [f"{stage} failed."]
     for attr in ("message", "msg", "code", "status"):
         val = getattr(err, attr, None)
-        if val: parts.append(f"{attr}: {val}")
-    # Some exceptions carry a response/body
+        if val:
+            parts.append(f"{attr}: {val}")
     resp = getattr(err, "response", None)
     if resp is not None:
         try:
@@ -92,8 +48,55 @@ def show_supabase_error(stage: str, err: Exception):
                 pass
     parts.append(f"args: {getattr(err, 'args', None)}")
     st.error("\n".join(str(p) for p in parts))
-    st.exception(err)  # still useful locally
+    # Still show stack trace locally (Streamlit may redact on Cloud, but it helps locally)
+    st.exception(err)
 
+def success_rerun(msg: str):
+    st.success(msg)
+    st.rerun()
+
+# -------------------------------
+# Session helpers
+# -------------------------------
+def attach_tokens(access: str, refresh: str):
+    """Attach tokens to both auth and postgrest clients (RLS needs the bearer)."""
+    sb.auth.set_session(access_token=access, refresh_token=refresh)
+    sb.postgrest.auth(access)
+
+def reattach_session():
+    """Re-attach tokens on reruns if saved."""
+    access = st.session_state.get("jwt")
+    refresh = st.session_state.get("rt")
+    if access and refresh:
+        sb.auth.set_session(access_token=access, refresh_token=refresh)
+        sb.postgrest.auth(access)
+
+def logout():
+    """Clear only local state; do not try to unauth PostgREST with None token."""
+    for k in ("user", "jwt", "rt", "org_id", "role"):
+        st.session_state.pop(k, None)
+    st.rerun()
+
+validate_config()
+reattach_session()
+
+# -------------------------------
+# Org & membership
+# -------------------------------
+def get_user_orgs(user_id: str) -> List[Dict]:
+    res = sb.table("org_members").select("org_id, role").eq("user_id", user_id).execute()
+    return res.data or []
+
+def create_store_for_logged_in_user(store_name: str) -> str:
+    """Creates org (name only) + membership(owner) using current user JWT."""
+    org = sb.table("orgs").insert({"name": store_name}).execute()
+    org_id = org.data[0]["id"]
+    sb.table("org_members").insert({
+        "user_id": st.session_state["user"]["id"],
+        "org_id": org_id,
+        "role": "owner"
+    }).execute()
+    return org_id
 
 # -------------------------------
 # Auth screen
@@ -106,10 +109,10 @@ def auth_screen():
 
     # --- SIGN UP ---
     with tab_signup:
-        store = st.text_input("Store name")
-        email = st.text_input("Owner email")
-        pw = st.text_input("Password", type="password")
-        if st.button("Create my store", type="primary", use_container_width=True):
+        store = st.text_input("Store name", key="signup_store")
+        email = st.text_input("Owner email", key="signup_email")
+        pw = st.text_input("Password", type="password", key="signup_pw")
+        if st.button("Create my store", type="primary", use_container_width=True, key="btn_create_store"):
             if not (store and email and pw):
                 st.error("All fields required.")
                 st.stop()
@@ -118,15 +121,23 @@ def auth_screen():
                 st.stop()
 
             # 1) sign up
-            out = sb.auth.sign_up({"email": email, "password": pw})
-            if not out.user:
-                st.error("Sign-up failed (email may exist or confirmation required).")
+            try:
+                out = sb.auth.sign_up({"email": email, "password": pw})
+            except Exception as e:
+                show_supabase_error("Sign-up", e)
+                st.stop()
+            if not out or not out.user:
+                st.error("Sign-up returned no user (email may exist or confirmation required).")
                 st.stop()
 
-            # 2) sign in to get session/JWT
-            sess = sb.auth.sign_in_with_password({"email": email, "password": pw})
-            if not sess.user:
-                st.error("Auto-login failed after sign-up (confirm email or disable confirmations).")
+            # 2) sign in to get session/JWT (email confirmation may block this if enabled)
+            try:
+                sess = sb.auth.sign_in_with_password({"email": email, "password": pw})
+            except Exception as e:
+                show_supabase_error("Auto-login", e)
+                st.stop()
+            if not sess or not sess.user:
+                st.error("Auto-login returned no user. If email confirmation is enabled, check your inbox.")
                 st.stop()
 
             # 3) store tokens and attach
@@ -140,16 +151,21 @@ def auth_screen():
                 _ = create_store_for_logged_in_user(store)
                 st.success("Store created. Please log in on the Log in tab.")
             except Exception as e:
-                st.error(f"Setup failed: {e}")
+                show_supabase_error("Post-setup (org creation)", e)
 
     # --- LOG IN ---
     with tab_login:
         email_l = st.text_input("Email", key="login_email")
         pw_l = st.text_input("Password", type="password", key="login_pw")
-        if st.button("Log in", type="primary", use_container_width=True):
-            sess = sb.auth.sign_in_with_password({"email": email_l, "password": pw_l})
-            if not sess.user:
-                st.error("Invalid email or password.")
+        if st.button("Log in", type="primary", use_container_width=True, key="btn_login"):
+            try:
+                sess = sb.auth.sign_in_with_password({"email": email_l, "password": pw_l})
+            except Exception as e:
+                show_supabase_error("Login", e)
+                st.stop()
+
+            if not sess or not sess.user:
+                st.error("Invalid email or password, or email not confirmed.")
                 st.stop()
 
             # keep session + attach tokens
@@ -162,7 +178,7 @@ def auth_screen():
             if not memberships:
                 st.info("No organization yet. Create one now:")
                 store_name = st.text_input("Store name", key="store_after_login")
-                if st.button("Create my store now", type="primary"):
+                if st.button("Create my store now", type="primary", key="btn_create_after_login"):
                     try:
                         org_id = create_store_for_logged_in_user(store_name)
                         st.session_state["org_id"] = org_id
@@ -170,7 +186,7 @@ def auth_screen():
                         st.success("Store created.")
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Setup failed: {e}")
+                        show_supabase_error("Post-login org creation", e)
                 st.stop()
 
             st.session_state["org_id"] = memberships[0]["org_id"]
@@ -184,7 +200,15 @@ def list_products(org_id: str) -> pd.DataFrame:
     res = sb.table("products").select("*").eq("org_id", org_id).order("name").execute()
     return pd.DataFrame(res.data or [])
 
-def upsert_product(org_id: str, pid: str | None, sku, name, category, unit, unit_cost, price, min_stock):
+def upsert_product(org_id: str,
+                   pid: Optional[str],
+                   sku: str,
+                   name: str,
+                   category: Optional[str],
+                   unit: Optional[str],
+                   unit_cost: float,
+                   price: float,
+                   min_stock: float):
     now = datetime.utcnow().isoformat()
     data = {
         "org_id": org_id,
@@ -222,10 +246,14 @@ def get_stock_df(org_id: str) -> pd.DataFrame:
 def receive_stock(org_id: str, product_id: str, qty: float, unit_cost: float):
     cur = sb.table("stock").select("qty").eq("product_id", product_id).single().execute().data or {"qty": 0}
     new_qty = float(cur["qty"] or 0) + float(qty)
-    sb.table("stock").upsert({"product_id": product_id, "qty": new_qty, "updated_at": datetime.utcnow().isoformat()}).execute()
+    sb.table("stock").upsert({
+        "product_id": product_id,
+        "qty": new_qty,
+        "updated_at": datetime.utcnow().isoformat()
+    }).execute()
     sb.table("products").update({"unit_cost": float(unit_cost)}).eq("id", product_id).eq("org_id", org_id).execute()
 
-def sell_items(org_id: str, lines: list[dict], ref: str | None):
+def sell_items(org_id: str, lines: List[Dict], ref: Optional[str]):
     total = sum(float(l["qty"]) * float(l["unit_price"]) for l in lines)
     sale = sb.table("sales").insert({"org_id": org_id, "ref": (ref or None), "total": total}).execute().data[0]
     sale_id = sale["id"]
@@ -238,10 +266,18 @@ def sell_items(org_id: str, lines: list[dict], ref: str | None):
         }).execute()
         cur = sb.table("stock").select("qty").eq("product_id", l["product_id"]).single().execute().data or {"qty": 0}
         new_qty = float(cur["qty"] or 0) - float(l["qty"])
-        sb.table("stock").upsert({"product_id": l["product_id"], "qty": new_qty, "updated_at": datetime.utcnow().isoformat()}).execute()
+        sb.table("stock").upsert({
+            "product_id": l["product_id"],
+            "qty": new_qty,
+            "updated_at": datetime.utcnow().isoformat()
+        }).execute()
 
 def adjust_stock(product_id: str, new_qty: float):
-    sb.table("stock").upsert({"product_id": product_id, "qty": float(new_qty), "updated_at": datetime.utcnow().isoformat()}).execute()
+    sb.table("stock").upsert({
+        "product_id": product_id,
+        "qty": float(new_qty),
+        "updated_at": datetime.utcnow().isoformat()
+    }).execute()
 
 def list_sales(org_id: str) -> pd.DataFrame:
     res = sb.table("sales").select("*").eq("org_id", org_id).order("created_at", desc=True).limit(50).execute()
@@ -258,12 +294,17 @@ def page_dashboard():
     total_items = len(stock)
     total_qty = float(stock["qty"].sum()) if not stock.empty else 0
     low = stock[stock["qty"] < stock["min_stock"]] if not stock.empty else pd.DataFrame()
-    with c1: st.metric("Item count", total_items)
-    with c2: st.metric("Total stock on hand", f"{total_qty:.2f}")
-    with c3: st.metric("Low-stock items", 0 if stock.empty else int((stock["qty"] < stock["min_stock"]).sum()))
+    with c1:
+        st.metric("Item count", total_items)
+    with c2:
+        st.metric("Total stock on hand", f"{total_qty:.2f}")
+    with c3:
+        st.metric("Low-stock items", 0 if stock.empty else int((stock["qty"] < stock["min_stock"]).sum()))
     st.subheader("Low stock")
-    if low.empty: st.info("No low-stock items. 🎉")
-    else: st.dataframe(low[["sku", "name", "qty", "min_stock", "category"]], use_container_width=True)
+    if low.empty:
+        st.info("No low-stock items. 🎉")
+    else:
+        st.dataframe(low[["sku", "name", "qty", "min_stock", "category"]], use_container_width=True)
     st.subheader("Recent sales")
     st.dataframe(list_sales(org_id), use_container_width=True)
 
@@ -276,8 +317,9 @@ def page_products():
         row = None
         if edit and not items.empty:
             items["display"] = items["sku"] + " — " + items["name"]
-            sel = st.selectbox("Select product", items["display"], index=None)
-            if sel: row = items.loc[items["display"] == sel].iloc[0]
+            sel = st.selectbox("Select product", items["display"], index=None, key="prod_select")
+            if sel:
+                row = items.loc[items["display"] == sel].iloc[0]
         sku = st.text_input("SKU", value=(row["sku"] if row is not None else "")).strip()
         name = st.text_input("Name", value=(row["name"] if row is not None else "")).strip()
         unit = st.text_input("Unit", value=(row["unit"] if row is not None else "pcs")).strip()
@@ -287,7 +329,7 @@ def page_products():
         min_stock = st.number_input("Min stock", min_value=0.0, value=float(row["min_stock"]) if row is not None else 0.0, step=1.0)
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Save product", type="primary", use_container_width=True):
+            if st.button("Save product", type="primary", use_container_width=True, key="btn_save_prod"):
                 if not sku or not name:
                     st.error("SKU and Name are required.")
                 else:
@@ -295,8 +337,9 @@ def page_products():
                     upsert_product(org_id, pid, sku, name, category, unit, unit_cost, price, min_stock)
                     success_rerun("Saved.")
         with c2:
-            if row is not None and st.button("Delete product", use_container_width=True):
-                delete_product(org_id, row["id"]); success_rerun("Deleted.")
+            if row is not None and st.button("Delete product", use_container_width=True, key="btn_del_prod"):
+                delete_product(org_id, row["id"])
+                success_rerun("Deleted.")
     st.divider()
     st.subheader("Products list")
     items = list_products(org_id)
@@ -307,64 +350,87 @@ def page_receive():
     st.markdown("# Receive Stock")
     org_id = st.session_state["org_id"]
     prods = list_products(org_id)
-    if prods.empty: st.info("Add products first."); return
+    if prods.empty:
+        st.info("Add products first.")
+        return
     prods["display"] = prods["sku"] + " — " + prods["name"]
-    sel = st.selectbox("Product", prods["display"], index=None)
-    if not sel: return
+    sel = st.selectbox("Product", prods["display"], index=None, key="recv_select")
+    if not sel:
+        return
     row = prods.loc[prods["display"] == sel].iloc[0]
-    qty = st.number_input("Quantity received", min_value=0.0, step=1.0)
-    unit_cost = st.number_input("Unit cost", min_value=0.0, step=0.01, value=float(row["unit_cost"] or 0))
-    if st.button("Record receipt", type="primary"):
-        if qty <= 0: st.error("Quantity must be > 0")
-        else: receive_stock(org_id, row["id"], qty, unit_cost); success_rerun("Receipt recorded.")
+    qty = st.number_input("Quantity received", min_value=0.0, step=1.0, key="recv_qty")
+    unit_cost = st.number_input("Unit cost", min_value=0.0, step=0.01, value=float(row["unit_cost"] or 0), key="recv_cost")
+    if st.button("Record receipt", type="primary", key="btn_recv"):
+        if qty <= 0:
+            st.error("Quantity must be > 0")
+        else:
+            receive_stock(org_id, row["id"], qty, unit_cost)
+            success_rerun("Receipt recorded.")
 
 def page_sell():
     st.markdown("# Sell / Issue")
     org_id = st.session_state["org_id"]
     stock = get_stock_df(org_id)
-    if stock.empty: st.info("Add products first."); return
+    if stock.empty:
+        st.info("Add products first.")
+        return
     stock["display"] = stock["sku"] + " — " + stock["name"] + "  (on hand: " + stock["qty"].astype(str) + ")"
-    sel = st.selectbox("Product", stock["display"], index=None)
-    if not sel: return
+    sel = st.selectbox("Product", stock["display"], index=None, key="sell_select")
+    if not sel:
+        return
     row = stock.loc[stock["display"] == sel].iloc[0]
     st.info(f"On hand: {row['qty']} {row['unit']}")
-    qty = st.number_input("Quantity to sell", min_value=0.0, step=1.0)
-    unit_price = st.number_input("Unit price", min_value=0.0, step=0.01, value=float(row.get("price", 0) or 0))
-    ref = st.text_input("Reference / Order #")
-    if st.button("Complete sale", type="primary"):
-        if qty <= 0: st.error("Quantity must be > 0")
-        else: sell_items(org_id, [{"product_id": row["id"], "qty": qty, "unit_price": unit_price}], ref); success_rerun("Sale recorded.")
+    qty = st.number_input("Quantity to sell", min_value=0.0, step=1.0, key="sell_qty")
+    unit_price = st.number_input("Unit price", min_value=0.0, step=0.01, value=float(row.get("price", 0) or 0), key="sell_price")
+    ref = st.text_input("Reference / Order #", key="sell_ref")
+    if st.button("Complete sale", type="primary", key="btn_sell"):
+        if qty <= 0:
+            st.error("Quantity must be > 0")
+        else:
+            sell_items(org_id, [{"product_id": row["id"], "qty": qty, "unit_price": unit_price}], ref)
+            success_rerun("Sale recorded.")
 
 def page_adjust():
     st.markdown("# Adjustments")
     org_id = st.session_state["org_id"]
     stock = get_stock_df(org_id)
-    if stock.empty: st.info("Add products first."); return
+    if stock.empty:
+        st.info("Add products first.")
+        return
     stock["display"] = stock["sku"] + " — " + stock["name"] + "  (current: " + stock["qty"].astype(str) + ")"
-    sel = st.selectbox("Product", stock["display"], index=None)
-    if not sel: return
+    sel = st.selectbox("Product", stock["display"], index=None, key="adj_select")
+    if not sel:
+        return
     row = stock.loc[stock["display"] == sel].iloc[0]
     st.info(f"Current on hand: {row['qty']} {row['unit']}")
-    desired = st.number_input("New counted quantity", min_value=0.0, step=1.0, value=float(row["qty"]))
-    if st.button("Record adjustment", type="primary"):
-        adjust_stock(row["id"], desired); success_rerun("Adjustment recorded.")
+    desired = st.number_input("New counted quantity", min_value=0.0, step=1.0, value=float(row["qty"]), key="adj_qty")
+    if st.button("Record adjustment", type="primary", key="btn_adj"):
+        adjust_stock(row["id"], desired)
+        success_rerun("Adjustment recorded.")
 
 def page_sales():
     st.markdown("# Sales")
     org_id = st.session_state["org_id"]
     df = list_sales(org_id)
-    if df.empty: st.info("No sales yet.")
+    if df.empty:
+        st.info("No sales yet.")
     else:
         st.dataframe(df, use_container_width=True)
-        st.download_button("Export CSV", df.to_csv(index=False).encode("utf-8"),
-                           file_name=f"sales_{date.today().isoformat()}.csv", mime="text/csv")
+        st.download_button(
+            "Export CSV",
+            df.to_csv(index=False).encode("utf-8"),
+            file_name=f"sales_{date.today().isoformat()}.csv",
+            mime="text/csv",
+            key="btn_export_sales"
+        )
 
 def page_settings():
     st.markdown("# Settings")
     st.caption("Supabase-backed, multi-tenant inventory.")
     st.write(f"**Org ID:** {st.session_state.get('org_id','—')}")
     st.write(f"**Role:** {st.session_state.get('role','')}")
-    if st.button("Log out"): logout()
+    if st.button("Log out", key="btn_logout"):
+        logout()
 
 # -------------------------------
 # Main
@@ -372,17 +438,25 @@ def page_settings():
 def main():
     # If not logged in or no org yet, show auth screen
     if "user" not in st.session_state or ("org_id" not in st.session_state):
-        auth_screen(); return
+        auth_screen()
+        return
 
-    st.sidebar.success("Signed in")
+    st.sidebar.success(f"Signed in as {st.session_state['user']['email']}")
     tabs = st.tabs(["Dashboard", "Products", "Receive", "Sell", "Adjustments", "Sales", "Settings"])
-    with tabs[0]: page_dashboard()
-    with tabs[1]: page_products()
-    with tabs[2]: page_receive()
-    with tabs[3]: page_sell()
-    with tabs[4]: page_adjust()
-    with tabs[5]: page_sales()
-    with tabs[6]: page_settings()
+    with tabs[0]:
+        page_dashboard()
+    with tabs[1]:
+        page_products()
+    with tabs[2]:
+        page_receive()
+    with tabs[3]:
+        page_sell()
+    with tabs[4]:
+        page_adjust()
+    with tabs[5]:
+        page_sales()
+    with tabs[6]:
+        page_settings()
 
 if __name__ == "__main__":
     main()
