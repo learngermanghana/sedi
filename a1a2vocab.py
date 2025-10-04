@@ -74,6 +74,27 @@ def create_store_for_logged_in_user(store_name: str) -> str:
     }).execute()
     return org_id
 
+def show_supabase_error(stage: str, err: Exception):
+    # Try to extract useful fields from Supabase auth exceptions
+    parts = [f"{stage} failed."]
+    for attr in ("message", "msg", "code", "status"):
+        val = getattr(err, attr, None)
+        if val: parts.append(f"{attr}: {val}")
+    # Some exceptions carry a response/body
+    resp = getattr(err, "response", None)
+    if resp is not None:
+        try:
+            parts.append(f"response_json: {resp.json()}")
+        except Exception:
+            try:
+                parts.append(f"response_text: {resp.text}")
+            except Exception:
+                pass
+    parts.append(f"args: {getattr(err, 'args', None)}")
+    st.error("\n".join(str(p) for p in parts))
+    st.exception(err)  # still useful locally
+
+
 # -------------------------------
 # Auth screen
 # -------------------------------
