@@ -37,8 +37,14 @@ def success_rerun(msg: str):
 # -------------------------------
 def create_org_and_membership(user_id: str, org_name: str):
     # 1) create org
-    org = sb.table("orgs").insert({"name": org_name}).execute()
-    org_id = org.data[0]["id"]
+    org_insert = sb.table("orgs").insert({
+        "name": org_name,
+        "owner_id": user_id,
+    }).execute()
+    org_data = org_insert.data or []
+    if not org_data or "id" not in org_data[0]:
+        raise RuntimeError("Failed to create organization")
+    org_id = org_data[0]["id"]
     # 2) add membership (requires insert policy on org_members)
     sb.table("org_members").insert({
         "user_id": user_id,
