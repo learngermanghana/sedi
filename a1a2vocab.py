@@ -1,620 +1,339 @@
-# streamlit_app.py
+# streamlit_app.py  — Supabase version (multi-tenant)
 import streamlit as st
-from supabase import create_client, Client
-import sqlite3
 import pandas as pd
 from datetime import datetime, date
-from typing import Optional
-import bcrypt
+from supabase import create_client, Client
 
-
-# Initialize Supabase client
+# -------------------------------
+# Setup
+# -------------------------------
+st.set_page_config(page_title="Inventory (Supabase)", page_icon="📦", layout="wide")
 url = st.secrets["SUPABASE_URL"]
 key = st.secrets["SUPABASE_ANON_KEY"]
-supabase: Client = create_client(url, key)
-
-
-DB_PATH = "data.db"
+sb: Client = create_client(url, key)
 
 # -------------------------------
-# SQLite helpers & bootstrap
+# Helpers
 # -------------------------------
-
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def col_exists(cur, table: str, col: str) -> bool:
-    cur.execute(f"PRAGMA table_info({table})")
-    return any(r["name"] == col for r in cur.fetchall())
-
-def init_db():
-    """Create base tables and add multi-tenant/auth columns safely."""
-    conn = get_conn()
-    cur = conn.cursor()
-
-    # --- Multi-tenant: stores & users
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS stores (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            store_id INTEGER NOT NULL,
-            email TEXT NOT NULL,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL CHECK(role IN ('owner','manager','cashier')) DEFAULT 'owner',
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(store_id, email),
-            FOREIGN KEY(store_id) REFERENCES stores(id)
-        )
-        """
-    )
-
-    # --- Domain tables
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sku TEXT UNIQUE NOT NULL,
-            name TEXT NOT NULL,
-            unit TEXT NOT NULL DEFAULT 'pcs',
-            cost REAL NOT NULL DEFAULT 0,
-            price REAL NOT NULL DEFAULT 0,
-            min_stock REAL NOT NULL DEFAULT 0,
-            category TEXT,
-            default_supplier_id INTEGER,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS suppliers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT,
-            phone TEXT,
-            address TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS movements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_id INTEGER NOT NULL,
-            type TEXT NOT NULL CHECK(type IN ('receive','issue','adjust','transfer')),
-            qty REAL NOT NULL,
-            unit_cost REAL,
-            ref TEXT,
-            note TEXT,
-            from_location TEXT,
-            to_location TEXT,
-            moved_at TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(item_id) REFERENCES items(id)
-        )
-        """
-    )
-
-    # --- Add store_id columns if missing
-    for tbl in ("items", "suppliers", "movements"):
-        if not col_exists(cur, tbl, "store_id"):
-            cur.execute(f"ALTER TABLE {tbl} ADD COLUMN store_id INTEGER")
-
-    # Indexes for performance / uniqueness per store
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_items_store ON items(store_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_suppliers_store ON suppliers(store_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_movements_store ON movements(store_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_movements_item ON movements(item_id)")
-
-    conn.commit()
-
-# -------------------------------
-# Auth helpers (very simple)
-# -------------------------------
-
-def hash_pw(pw: str) -> str:
-    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
-
-def verify_pw(pw: str, hashed: str) -> bool:
-    try:
-        return bcrypt.checkpw(pw.encode(), hashed.encode())
-    except Exception:
-        return False
-
-def create_store_and_owner(store_name: str, email: str, password: str) -> int:
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("INSERT INTO stores(name) VALUES (?)", (store_name.strip(),))
-    store_id = cur.lastrowid
-    cur.execute(
-        "INSERT INTO users(store_id,email,password_hash,role) VALUES (?,?,?,?)",
-        (store_id, email.strip().lower(), hash_pw(password), "owner"),
-    )
-    conn.commit()
-    return store_id
-
-def login(email: str, password: str) -> Optional[dict]:
-    cur = get_conn().cursor()
-    cur.execute("SELECT * FROM users WHERE email=?", (email.strip().lower(),))
-    u = cur.fetchone()
-    if u and verify_pw(password, u["password_hash"]):
-        return dict(u)
-    return None
-
-def current_store_id() -> int:
-    return int(st.session_state["store_id"])
-
 def require_auth():
     if "user" not in st.session_state:
         auth_screen()
         st.stop()
 
 def logout():
-    for k in ("user", "store_id"):
+    for k in ("user", "org_id", "role"):
         st.session_state.pop(k, None)
-    st.experimental_rerun()
-
-# -------------------------------
-# Data access (scoped by store)
-# -------------------------------
-
-def upsert_item(item_id: Optional[int], sku, name, unit, cost, price, min_stock, category, default_supplier_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    now = datetime.utcnow().isoformat()
-    store_id = current_store_id()
-
-    if item_id:
-        cur.execute(
-            """
-            UPDATE items
-            SET sku=?, name=?, unit=?, cost=?, price=?, min_stock=?, category=?, default_supplier_id=?, updated_at=?
-            WHERE id=? AND store_id=?
-            """,
-            (sku, name, unit, cost, price, min_stock, category, default_supplier_id, now, item_id, store_id),
-        )
-    else:
-        cur.execute(
-            """
-            INSERT INTO items (sku, name, unit, cost, price, min_stock, category, default_supplier_id,
-                               created_at, updated_at, store_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (sku, name, unit, cost, price, min_stock, category, default_supplier_id, now, now, store_id),
-        )
-    conn.commit()
-
-def delete_item(item_id: int):
-    conn = get_conn()
-    conn.execute("DELETE FROM items WHERE id=? AND store_id=?", (item_id, current_store_id()))
-    conn.commit()
-
-def upsert_supplier(supplier_id: Optional[int], name, email, phone, address):
-    conn = get_conn()
-    cur = conn.cursor()
-    now = datetime.utcnow().isoformat()
-    store_id = current_store_id()
-
-    if supplier_id:
-        cur.execute(
-            """
-            UPDATE suppliers
-            SET name=?, email=?, phone=?, address=?, updated_at=?
-            WHERE id=? AND store_id=?
-            """,
-            (name, email, phone, address, now, supplier_id, store_id),
-        )
-    else:
-        cur.execute(
-            """
-            INSERT INTO suppliers (name, email, phone, address, created_at, updated_at, store_id)
-            VALUES (?,?,?,?,?,?,?)
-            """,
-            (name, email, phone, address, now, now, store_id),
-        )
-    conn.commit()
-
-def delete_supplier(supplier_id: int):
-    conn = get_conn()
-    conn.execute("DELETE FROM suppliers WHERE id=? AND store_id=?", (supplier_id, current_store_id()))
-    conn.commit()
-
-def record_movement(item_id: int, type_: str, qty: float, unit_cost: Optional[float],
-                    ref: str, note: str, from_loc: Optional[str], to_loc: Optional[str], moved_at: str):
-    conn = get_conn()
-    conn.execute(
-        """
-        INSERT INTO movements (item_id, type, qty, unit_cost, ref, note, from_location, to_location, moved_at, store_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
-        """,
-        (item_id, type_, qty, unit_cost, ref, note, from_loc, to_loc, moved_at, current_store_id()),
-    )
-    conn.commit()
-
-def df_items() -> pd.DataFrame:
-    return pd.read_sql_query(
-        "SELECT * FROM items WHERE store_id=? ORDER BY name",
-        get_conn(), params=(current_store_id(),)
-    )
-
-def df_suppliers() -> pd.DataFrame:
-    return pd.read_sql_query(
-        "SELECT * FROM suppliers WHERE store_id=? ORDER BY name",
-        get_conn(), params=(current_store_id(),)
-    )
-
-def df_movements() -> pd.DataFrame:
-    return pd.read_sql_query(
-        """
-        SELECT m.id, m.moved_at, m.type,
-               i.sku, i.name as item_name, m.qty, m.unit_cost, m.ref, m.note,
-               m.from_location, m.to_location
-        FROM movements m
-        JOIN items i ON i.id = m.item_id
-        WHERE m.store_id=? AND i.store_id=?
-        ORDER BY m.moved_at DESC, m.id DESC
-        """,
-        get_conn(), params=(current_store_id(), current_store_id())
-    )
-
-def stock_on_hand(item_id: int) -> float:
-    cur = get_conn().cursor()
-    cur.execute(
-        """
-        SELECT COALESCE(SUM(CASE WHEN type IN ('receive','adjust') THEN qty ELSE -qty END), 0)
-        FROM movements
-        WHERE item_id=? AND store_id=?
-        """,
-        (item_id, current_store_id()),
-    )
-    (qty,) = cur.fetchone()
-    return float(qty or 0)
-
-def df_stock() -> pd.DataFrame:
-    items = df_items()
-    if items.empty:
-        return pd.DataFrame(columns=["id", "sku", "name", "unit", "on_hand", "min_stock", "category", "supplier"])
-    items = items.copy()
-    items["on_hand"] = items["id"].apply(stock_on_hand)
-    sup = df_suppliers().rename(columns={"id": "supplier_id"})[["supplier_id", "name"]]
-    items = items.merge(sup, left_on="default_supplier_id", right_on="supplier_id", how="left")
-    items.rename(columns={"name_y": "supplier", "name_x": "name"}, inplace=True)
-    return items[["id", "sku", "name", "unit", "on_hand", "min_stock", "category", "supplier"]]
-
-# -------------------------------
-# UI helpers
-# -------------------------------
-
-def page_header(title: str, subtitle: Optional[str] = None):
-    st.markdown(f"# {title}")
-    if subtitle:
-        st.caption(subtitle)
+    st.rerun()
 
 def success_rerun(msg: str):
     st.success(msg)
-    st.experimental_rerun()
+    st.rerun()
 
 # -------------------------------
-# Auth screen
+# Auth & org wiring
 # -------------------------------
+def create_org_and_membership(user_id: str, org_name: str):
+    # 1) create org
+    org = sb.table("orgs").insert({"name": org_name}).execute()
+    org_id = org.data[0]["id"]
+    # 2) add membership (requires insert policy on org_members)
+    sb.table("org_members").insert({
+        "user_id": user_id,
+        "org_id": org_id,
+        "role": "owner"
+    }).execute()
+    return org_id
+
+def get_user_orgs(user_id: str):
+    res = sb.table("org_members").select("org_id, role").eq("user_id", user_id).execute()
+    return res.data
 
 def auth_screen():
-    st.set_page_config(page_title="Inventory App", page_icon="📦", layout="wide")
-    init_db()
-    st.title("📦 Inventory — Sign in")
-    st.caption("Create a store or log in to continue")
+    st.title("📦 Inventory (Supabase)")
+    st.caption("Sign up to create a store, or log in to manage your inventory.")
 
     tab_login, tab_signup = st.tabs(["Log in", "Create store"])
 
     with tab_signup:
-        sname = st.text_input("Store name", key="signup_store")
-        semail = st.text_input("Owner email", key="signup_email")
-        spass = st.text_input("Password", type="password", key="signup_pw")
+        store = st.text_input("Store name")
+        email = st.text_input("Owner email")
+        pw = st.text_input("Password", type="password")
         if st.button("Create my store", type="primary", use_container_width=True):
-            if not (sname and semail and spass):
-                st.error("All fields are required.")
+            if not (store and email and pw):
+                st.error("All fields required.")
             else:
-                try:
-                    _ = create_store_and_owner(sname, semail, spass)
-                    st.success("Store created. Please log in on the next tab.")
-                except sqlite3.IntegrityError as e:
-                    st.error(f"Could not create store: {e}")
+                out = sb.auth.sign_up({"email": email, "password": pw})
+                if out.user:
+                    try:
+                        org_id = create_org_and_membership(out.user.id, store)
+                        st.success("Store created. Please log in.")
+                    except Exception as e:
+                        st.error("Membership insert failed. In Supabase SQL, add an INSERT policy on org_members allowing auth.uid().")
+                else:
+                    st.error("Sign-up failed.")
 
     with tab_login:
-        email = st.text_input("Email", key="login_email")
-        pwd = st.text_input("Password", type="password", key="login_pw")
+        email_l = st.text_input("Email", key="login_email")
+        pw_l = st.text_input("Password", type="password", key="login_pw")
         if st.button("Log in", type="primary", use_container_width=True):
-            user = login(email, pwd)
-            if user:
-                st.session_state["user"] = user
-                st.session_state["store_id"] = user["store_id"]
-                st.experimental_rerun()
+            sess = sb.auth.sign_in_with_password({"email": email_l, "password": pw_l})
+            if sess.user:
+                st.session_state["user"] = {"id": sess.user.id, "email": email_l}
+                memberships = get_user_orgs(sess.user.id)
+                if not memberships:
+                    st.warning("No organization yet. Use 'Create store' first.")
+                    st.stop()
+                st.session_state["org_id"] = memberships[0]["org_id"]
+                st.session_state["role"] = memberships[0]["role"]
+                st.rerun()
             else:
                 st.error("Invalid email or password.")
 
 # -------------------------------
-# Pages
+# Data access (Supabase)
 # -------------------------------
+def list_products(org_id: str) -> pd.DataFrame:
+    res = sb.table("products").select("*").eq("org_id", org_id).order("name").execute()
+    df = pd.DataFrame(res.data or [])
+    return df
 
+def upsert_product(org_id: str, pid: str|None, sku, name, category, unit, unit_cost, price, min_stock):
+    now = datetime.utcnow().isoformat()
+    data = {
+        "org_id": org_id, "sku": sku, "name": name, "category": category or None,
+        "unit": unit or "pcs", "unit_cost": float(unit_cost or 0),
+        "price": float(price or 0), "min_stock": float(min_stock or 0),
+        "updated_at": now
+    }
+    if pid:
+        sb.table("products").update(data).eq("id", pid).eq("org_id", org_id).execute()
+    else:
+        data["created_at"] = now
+        ins = sb.table("products").insert(data).execute()
+        new_id = ins.data[0]["id"]
+        # ensure stock row exists
+        sb.table("stock").upsert({"product_id": new_id, "qty": 0}).execute()
+
+def delete_product(org_id: str, pid: str):
+    # cascades will remove stock/sale_items via FK if defined; otherwise delete manually
+    sb.table("products").delete().eq("id", pid).eq("org_id", org_id).execute()
+
+def get_stock_df(org_id: str) -> pd.DataFrame:
+    prods = list_products(org_id)
+    if prods.empty:
+        return pd.DataFrame(columns=["id","sku","name","unit","qty","min_stock","category"])
+    # fetch stock rows
+    ids = prods["id"].tolist()
+    st_rows = sb.table("stock").select("*").in_("product_id", ids).execute().data
+    stock = pd.DataFrame(st_rows or [])
+    stock = stock.rename(columns={"product_id":"id"})
+    merged = prods.merge(stock[["id","qty"]], on="id", how="left")
+    merged["qty"] = merged["qty"].fillna(0)
+    return merged[["id","sku","name","unit","qty","min_stock","category"]]
+
+def receive_stock(org_id: str, product_id: str, qty: float, unit_cost: float):
+    # increment qty; update unit_cost (latest)
+    # 1) current stock
+    cur = sb.table("stock").select("qty").eq("product_id", product_id).single().execute().data or {"qty": 0}
+    new_qty = float(cur["qty"] or 0) + float(qty)
+    sb.table("stock").upsert({"product_id": product_id, "qty": new_qty, "updated_at": datetime.utcnow().isoformat()}).execute()
+    sb.table("products").update({"unit_cost": float(unit_cost)}).eq("id", product_id).eq("org_id", org_id).execute()
+
+def sell_items(org_id: str, lines: list[dict], ref: str|None):
+    # lines: [{product_id, qty, unit_price}]
+    total = sum(float(l["qty"])*float(l["unit_price"]) for l in lines)
+    sale = sb.table("sales").insert({"org_id": org_id, "ref": ref or None, "total": total}).execute().data[0]
+    sale_id = sale["id"]
+    # insert items + decrement stock
+    for l in lines:
+        sb.table("sale_items").insert({
+            "sale_id": sale_id,
+            "product_id": l["product_id"],
+            "qty": float(l["qty"]),
+            "unit_price": float(l["unit_price"]),
+        }).execute()
+        # decrement
+        cur = sb.table("stock").select("qty").eq("product_id", l["product_id"]).single().execute().data or {"qty": 0}
+        new_qty = float(cur["qty"] or 0) - float(l["qty"])
+        sb.table("stock").upsert({"product_id": l["product_id"], "qty": new_qty, "updated_at": datetime.utcnow().isoformat()}).execute()
+
+def adjust_stock(product_id: str, new_qty: float):
+    sb.table("stock").upsert({"product_id": product_id, "qty": float(new_qty), "updated_at": datetime.utcnow().isoformat()}).execute()
+
+def list_sales(org_id: str) -> pd.DataFrame:
+    res = sb.table("sales").select("*").eq("org_id", org_id).order("created_at", desc=True).limit(50).execute()
+    return pd.DataFrame(res.data or [])
+
+# -------------------------------
+# UI Pages
+# -------------------------------
 def page_dashboard():
-    page_header("Dashboard", "Today at a glance")
-    stock = df_stock()
-
+    st.markdown("# Dashboard")
+    org_id = st.session_state["org_id"]
+    stock = get_stock_df(org_id)
     c1, c2, c3 = st.columns(3)
     total_items = len(stock)
-    total_qty = float(stock["on_hand"].sum()) if not stock.empty else 0
-    low_stock_df = stock[stock["on_hand"] < stock["min_stock"]] if not stock.empty else pd.DataFrame()
+    total_qty = float(stock["qty"].sum()) if not stock.empty else 0
+    low = stock[stock["qty"] < stock["min_stock"]] if not stock.empty else pd.DataFrame()
+    with c1: st.metric("Item count", total_items)
+    with c2: st.metric("Total stock on hand", f"{total_qty:.2f}")
+    with c3: st.metric("Low-stock items", 0 if stock.empty else int((stock["qty"] < stock["min_stock"]).sum()))
 
-    with c1:
-        st.metric("Item count", total_items)
-    with c2:
-        st.metric("Total stock on hand", f"{total_qty:.2f}")
-    with c3:
-        st.metric("Low-stock items", 0 if stock.empty else int((stock["on_hand"] < stock["min_stock"]).sum()))
-
-    st.subheader("Low stock alerts")
-    if low_stock_df is None or low_stock_df.empty:
+    st.subheader("Low stock")
+    if low.empty:
         st.info("No low-stock items. 🎉")
     else:
-        st.dataframe(low_stock_df[["sku", "name", "on_hand", "min_stock", "supplier"]], use_container_width=True)
+        st.dataframe(low[["sku","name","qty","min_stock","category"]], use_container_width=True)
 
-    st.subheader("Recent movements")
-    moves = df_movements().head(20)
-    st.dataframe(moves, use_container_width=True)
+    st.subheader("Recent sales")
+    sales = list_sales(org_id)
+    st.dataframe(sales, use_container_width=True)
 
-def page_items():
-    page_header("Items", "Manage your catalog")
-    items = df_items()
-    suppliers = df_suppliers()
+def page_products():
+    st.markdown("# Products")
+    org_id = st.session_state["org_id"]
+    items = list_products(org_id)
 
-    with st.expander("➕ Create / Edit item", expanded=True):
-        edit_mode = st.checkbox("Edit existing item", key="items_edit")
+    with st.expander("➕ Create / Edit product", expanded=True):
+        edit = st.checkbox("Edit existing product", key="prod_edit")
         row = None
-        if edit_mode and not items.empty:
-            # show SKU + name for uniqueness
+        if edit and not items.empty:
             items["display"] = items["sku"] + " — " + items["name"]
-            choice = st.selectbox("Select item", items["display"], index=None, key="items_select")
-            if choice:
-                row = items.loc[items["display"] == choice].iloc[0]
+            sel = st.selectbox("Select product", items["display"], index=None)
+            if sel:
+                row = items.loc[items["display"] == sel].iloc[0]
 
-        sku = st.text_input("SKU", value=(row["sku"] if row is not None else ""), key="items_sku").strip()
-        name = st.text_input("Name", value=(row["name"] if row is not None else ""), key="items_name").strip()
-        unit = st.text_input("Unit", value=(row["unit"] if row is not None else "pcs"), key="items_unit").strip()
-        cost = st.number_input("Cost", min_value=0.0, value=float(row["cost"]) if row is not None else 0.0, step=0.01, key="items_cost")
-        price = st.number_input("Price", min_value=0.0, value=float(row["price"]) if row is not None else 0.0, step=0.01, key="items_price")
-        min_stock = st.number_input("Min stock", min_value=0.0, value=float(row["min_stock"]) if row is not None else 0.0, step=1.0, key="items_min_stock")
-        category = st.text_input("Category", value=(row["category"] if row is not None else ""), key="items_category")
-
-        supplier_display = ["—"] + (suppliers["name"].tolist() if not suppliers.empty else [])
-        supplier_choice = st.selectbox("Default supplier", supplier_display, index=0, key="items_supplier")
-        default_supplier_id = None
-        if supplier_choice != "—" and not suppliers.empty:
-            default_supplier_id = int(suppliers.loc[suppliers["name"] == supplier_choice, "id"].iloc[0])
-
+        sku = st.text_input("SKU", value=(row["sku"] if row is not None else "")).strip()
+        name = st.text_input("Name", value=(row["name"] if row is not None else "")).strip()
+        unit = st.text_input("Unit", value=(row["unit"] if row is not None else "pcs")).strip()
+        category = st.text_input("Category", value=(row["category"] if row is not None else "")).strip()
+        unit_cost = st.number_input("Unit cost", min_value=0.0, value=float(row["unit_cost"]) if row is not None else 0.0, step=0.01)
+        price = st.number_input("Price", min_value=0.0, value=float(row["price"]) if row is not None else 0.0, step=0.01)
+        min_stock = st.number_input("Min stock", min_value=0.0, value=float(row["min_stock"]) if row is not None else 0.0, step=1.0)
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Save item", use_container_width=True, type="primary", key="items_save"):
+            if st.button("Save product", type="primary", use_container_width=True):
                 if not sku or not name:
                     st.error("SKU and Name are required.")
                 else:
-                    item_id = int(row["id"]) if row is not None else None
-                    try:
-                        upsert_item(item_id, sku, name, unit, cost, price, min_stock, category, default_supplier_id)
-                        success_rerun("Item saved")
-                    except sqlite3.IntegrityError as e:
-                        st.error(f"Error: {e}")
+                    pid = row["id"] if row is not None else None
+                    upsert_product(org_id, pid, sku, name, category, unit, unit_cost, price, min_stock)
+                    success_rerun("Saved.")
         with c2:
-            if row is not None and st.button("Delete item", use_container_width=True, key="items_delete"):
-                delete_item(int(row["id"]))
-                success_rerun("Item deleted")
+            if row is not None and st.button("Delete product", use_container_width=True):
+                delete_product(org_id, row["id"])
+                success_rerun("Deleted.")
 
     st.divider()
-    st.subheader("Items list")
+    st.subheader("Products list")
+    items = list_products(org_id)
+    show = ["sku","name","unit","unit_cost","price","min_stock","category","updated_at"]
     if items.empty:
-        st.info("No items yet.")
+        st.info("No products yet.")
     else:
-        show_cols = ["sku", "name", "unit", "cost", "price", "min_stock", "category"]
-        st.dataframe(items[show_cols], use_container_width=True)
-
-def page_suppliers():
-    page_header("Suppliers", "Who you buy from")
-    suppliers = df_suppliers()
-
-    with st.expander("➕ Create / Edit supplier", expanded=True):
-        edit_mode = st.checkbox("Edit existing supplier", key="sup_edit")
-        row = None
-        if edit_mode and not suppliers.empty:
-            choice = st.selectbox("Select supplier", suppliers["name"], index=None, key="sup_select")
-            if choice:
-                row = suppliers.loc[suppliers["name"] == choice].iloc[0]
-
-        name = st.text_input("Name", value=(row["name"] if row is not None else ""), key="sup_name").strip()
-        email = st.text_input("Email", value=(row["email"] if row is not None else ""), key="sup_email").strip()
-        phone = st.text_input("Phone", value=(row["phone"] if row is not None else ""), key="sup_phone").strip()
-        address = st.text_area("Address", value=(row["address"] if row is not None else "").strip(), key="sup_address")
-
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Save supplier", type="primary", use_container_width=True, key="sup_save"):
-                if not name:
-                    st.error("Name is required.")
-                else:
-                    supplier_id = int(row["id"]) if row is not None else None
-                    upsert_supplier(supplier_id, name, email, phone, address)
-                    success_rerun("Supplier saved")
-        with c2:
-            if row is not None and st.button("Delete supplier", use_container_width=True, key="sup_delete"):
-                delete_supplier(int(row["id"]))
-                success_rerun("Supplier deleted")
-
-    st.divider()
-    st.subheader("Suppliers list")
-    if suppliers.empty:
-        st.info("No suppliers yet.")
-    else:
-        show_cols = ["name", "email", "phone", "address"]
-        st.dataframe(suppliers[show_cols], use_container_width=True)
-
-def movement_form(type_: str):
-    pfx = f"{type_}_"
-    items = df_items()
-    if items.empty:
-        st.warning("Create items first.")
-        return
-
-    items["display"] = items["sku"] + " — " + items["name"]
-    item_display = st.selectbox("Item", items["display"], index=None, key=pfx + "item")
-    if not item_display:
-        return
-    row = items.loc[items["display"] == item_display].iloc[0]
-    item_id = int(row["id"])
-
-    if type_ == "receive":
-        qty = st.number_input("Quantity received", min_value=0.0, step=1.0, key=pfx + "qty")
-        unit_cost = st.number_input("Unit cost", min_value=0.0, step=0.01, value=float(row["cost"]), key=pfx + "unit_cost")
-        ref = st.text_input("Reference / Invoice #", key=pfx + "ref")
-        note = st.text_area("Note", key=pfx + "note")
-        moved_at = st.date_input("Date", value=date.today(), key=pfx + "date").isoformat()
-        if st.button("Record receipt", type="primary", key=pfx + "btn"):
-            if qty <= 0:
-                st.error("Quantity must be greater than 0")
-            else:
-                record_movement(item_id, "receive", qty, unit_cost, ref, note, None, None, moved_at)
-                success_rerun("Receipt recorded")
-
-    elif type_ == "issue":
-        on_hand = stock_on_hand(item_id)
-        st.info(f"On hand: {on_hand} {row['unit']}")
-        qty = st.number_input("Quantity issued", min_value=0.0, step=1.0, key=pfx + "qty")
-        unit_cost = None
-        ref = st.text_input("Reference / Order #", key=pfx + "ref")
-        note = st.text_area("Note", key=pfx + "note")
-        moved_at = st.date_input("Date", value=date.today(), key=pfx + "date").isoformat()
-        if st.button("Record issue", type="primary", key=pfx + "btn"):
-            if qty <= 0:
-                st.error("Quantity must be greater than 0")
-            elif qty > on_hand:
-                st.warning("Issuing more than on-hand will drive stock negative.")
-                record_movement(item_id, "issue", qty, unit_cost, ref, note, None, None, moved_at)
-                success_rerun("Issue recorded (negative stock)")
-            else:
-                record_movement(item_id, "issue", qty, unit_cost, ref, note, None, None, moved_at)
-                success_rerun("Issue recorded")
-
-    elif type_ == "adjust":
-        on_hand = stock_on_hand(item_id)
-        st.info(f"Current on hand: {on_hand} {row['unit']}")
-        desired = st.number_input("New counted quantity", min_value=0.0, step=1.0, value=on_hand, key=pfx + "desired")
-        delta = desired - on_hand
-        st.caption(f"Adjustment delta: {delta}")
-        ref = st.text_input("Reference", key=pfx + "ref")
-        note = st.text_area("Reason / Note", key=pfx + "note")
-        moved_at = st.date_input("Date", value=date.today(), key=pfx + "date").isoformat()
-        if st.button("Record adjustment", type="primary", key=pfx + "btn"):
-            if delta == 0:
-                st.info("No change needed.")
-            else:
-                record_movement(item_id, "adjust", delta, None, ref, note, None, None, moved_at)
-                success_rerun("Adjustment recorded")
+        st.dataframe(items[show], use_container_width=True)
 
 def page_receive():
-    page_header("Receive Stock", "Add inventory coming in")
-    movement_form("receive")
+    st.markdown("# Receive Stock")
+    org_id = st.session_state["org_id"]
+    prods = list_products(org_id)
+    if prods.empty:
+        st.info("Add products first.")
+        return
+    prods["display"] = prods["sku"] + " — " + prods["name"]
+    sel = st.selectbox("Product", prods["display"], index=None)
+    if not sel: return
+    row = prods.loc[prods["display"] == sel].iloc[0]
+    qty = st.number_input("Quantity received", min_value=0.0, step=1.0)
+    unit_cost = st.number_input("Unit cost", min_value=0.0, step=0.01, value=float(row["unit_cost"] or 0))
+    if st.button("Record receipt", type="primary"):
+        if qty <= 0:
+            st.error("Quantity must be > 0")
+        else:
+            receive_stock(org_id, row["id"], qty, unit_cost)
+            success_rerun("Receipt recorded.")
 
-def page_issue():
-    page_header("Issue Stock", "Record inventory going out")
-    movement_form("issue")
+def page_sell():
+    st.markdown("# Sell / Issue")
+    org_id = st.session_state["org_id"]
+    stock = get_stock_df(org_id)
+    if stock.empty:
+        st.info("Add products first.")
+        return
+    stock["display"] = stock["sku"] + " — " + stock["name"] + "  (on hand: " + stock["qty"].astype(str) + ")"
+    sel = st.selectbox("Product", stock["display"], index=None)
+    if not sel: return
+    row = stock.loc[stock["display"] == sel].iloc[0]
+    st.info(f"On hand: {row['qty']} {row['unit']}")
+    qty = st.number_input("Quantity to sell", min_value=0.0, step=1.0)
+    unit_price = st.number_input("Unit price", min_value=0.0, step=0.01, value=float(row.get("price", 0) or 0))
+    ref = st.text_input("Reference / Order #")
+    if st.button("Complete sale", type="primary"):
+        if qty <= 0:
+            st.error("Quantity must be > 0")
+        else:
+            sell_items(org_id, [{"product_id": row["id"], "qty": qty, "unit_price": unit_price}], ref)
+            success_rerun("Sale recorded.")
 
-def page_adjustments():
-    page_header("Adjustments", "Correct counts after stocktake or damage")
-    movement_form("adjust")
+def page_adjust():
+    st.markdown("# Adjustments")
+    org_id = st.session_state["org_id"]
+    stock = get_stock_df(org_id)
+    if stock.empty:
+        st.info("Add products first.")
+        return
+    stock["display"] = stock["sku"] + " — " + stock["name"] + "  (current: " + stock["qty"].astype(str) + ")"
+    sel = st.selectbox("Product", stock["display"], index=None)
+    if not sel: return
+    row = stock.loc[stock["display"] == sel].iloc[0]
+    st.info(f"Current on hand: {row['qty']} {row['unit']}")
+    desired = st.number_input("New counted quantity", min_value=0.0, step=1.0, value=float(row["qty"]))
+    if st.button("Record adjustment", type="primary"):
+        adjust_stock(row["id"], desired)
+        success_rerun("Adjustment recorded.")
 
-def page_movements():
-    page_header("Stock Movements", "All receipts, issues and adjustments")
-    df = df_movements()
+def page_sales():
+    st.markdown("# Sales")
+    org_id = st.session_state["org_id"]
+    df = list_sales(org_id)
     if df.empty:
-        st.info("No movements yet.")
+        st.info("No sales yet.")
     else:
         st.dataframe(df, use_container_width=True)
         st.download_button(
             "Export CSV",
             df.to_csv(index=False).encode("utf-8"),
-            file_name=f"movements_{datetime.now().date()}.csv",
+            file_name=f"sales_{date.today().isoformat()}.csv",
             mime="text/csv",
         )
 
 def page_settings():
-    page_header("Settings", "General configuration")
-    st.write(
-        "This MVP stores data in a local SQLite file (`data.db`). "
-        "For multi-user cloud use, switch to a hosted DB like Supabase/Postgres and add real auth."
-    )
-    st.code(
-        "# Example: connect to Postgres instead of SQLite\n"
-        "import psycopg2\n"
-        "conn = psycopg2.connect(dsn_from_streamlit_secrets)",
-        language="python",
-    )
-    st.divider()
-    if st.button("Log out", type="secondary"):
+    st.markdown("# Settings")
+    st.caption("You are signed in to a Supabase-backed, multi-tenant inventory app.")
+    st.write(f"**Org ID:** {st.session_state['org_id']}")
+    st.write(f"**Role:** {st.session_state.get('role','')}")
+    if st.button("Log out"):
         logout()
 
 # -------------------------------
 # Main
 # -------------------------------
-
 def main():
-    st.set_page_config(page_title="Inventory App", page_icon="📦", layout="wide")
-    init_db()
-
-    # Require login
     if "user" not in st.session_state:
         auth_screen()
         return
 
-    st.title("📦 Inventory")
-    st.caption("Multi-tenant (per-store) · Data stored in data.db · Use the tabs below")
-
+    st.sidebar.success("Signed in")
     tabs = st.tabs([
-        "Dashboard",
-        "Items",
-        "Suppliers",
-        "Receive",
-        "Issue",
-        "Adjustments",
-        "Movements",
-        "Settings",
+        "Dashboard", "Products", "Receive", "Sell", "Adjustments", "Sales", "Settings"
     ])
-
-    with tabs[0]:
-        page_dashboard()
-    with tabs[1]:
-        page_items()
-    with tabs[2]:
-        page_suppliers()
-    with tabs[3]:
-        page_receive()
-    with tabs[4]:
-        page_issue()
-    with tabs[5]:
-        page_adjustments()
-    with tabs[6]:
-        page_movements()
-    with tabs[7]:
-        page_settings()
+    with tabs[0]: page_dashboard()
+    with tabs[1]: page_products()
+    with tabs[2]: page_receive()
+    with tabs[3]: page_sell()
+    with tabs[4]: page_adjust()
+    with tabs[5]: page_sales()
+    with tabs[6]: page_settings()
 
 if __name__ == "__main__":
     main()
