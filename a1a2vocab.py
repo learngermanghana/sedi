@@ -48,12 +48,14 @@ def get_user_orgs(user_id: str):
     res = sb.table("org_members").select("org_id, role").eq("user_id", user_id).execute()
     return res.data
 
+
 def auth_screen():
     st.title("📦 Inventory (Supabase)")
     st.caption("Sign up to create a store, or log in to manage your inventory.")
 
     tab_login, tab_signup = st.tabs(["Log in", "Create store"])
 
+    # ---------- SIGN UP (create store) ----------
     with tab_signup:
         store = st.text_input("Store name")
         email = st.text_input("Owner email")
@@ -62,15 +64,49 @@ def auth_screen():
             if not (store and email and pw):
                 st.error("All fields required.")
             else:
+                # 1) Create auth user
                 out = sb.auth.sign_up({"email": email, "password": pw})
-                if out.user:
-                    try:
-                        org_id = create_org_and_membership(out.user.id, store)
-                        st.success("Store created. Please log in.")
-                    except Exception as e:
-                        st.error("Membership insert failed. In Supabase SQL, add an INSERT policy on org_members allowing auth.uid().")
-                else:
+                if not out.user:
                     st.error("Sign-up failed.")
+                    st.stop()
+
+                # NOTE: if email confirmations are ON, user must confirm before login.
+                # For testing, you can disable confirmations in Supabase Auth settings.
+
+                # 2) Ensure we have an authenticated session for policy-covered inserts
+                sess = sb.auth.sign_in_with_password({"email": email, "password": pw})
+                if not sess.user:
+                    st.error("Auto-login failed after sign-up (email may need confirmation).")
+                    st.stop()
+
+                # 3) Create org + membership (requires:
+                #    - INSERT policy on orgs (p_orgs_insert)
+                #    - INSERT policy on org_members with check user_id = auth.uid())
+                try:
+                    _org_id = create_org_and_membership(sess.user.id, store)
+                    st.success("Store created. Please log in on the Log in tab.")
+                except Exception as e:
+                    st.error(f"Setup failed: {e}")
+
+    # ---------- LOG IN ----------
+    with tab_login:
+        email_l = st.text_input("Email", key="login_email")
+        pw_l = st.text_input("Password", type="password", key="login_pw")
+        if st.button("Log in", type="primary", use_container_width=True):
+            sess = sb.auth.sign_in_with_password({"email": email_l, "password": pw_l})
+            if not sess.user:
+                st.error("Invalid email or password.")
+                st.stop()
+
+            st.session_state["user"] = {"id": sess.user.id, "email": email_l}
+            memberships = get_user_orgs(sess.user.id)
+            if not memberships:
+                st.warning("No organization yet. Use 'Create store' first.")
+                st.stop()
+
+            st.session_state["org_id"] = memberships[0]["org_id"]
+            st.session_state["role"] = memberships[0]["role"]
+            st.rerun()
 
     with tab_login:
         email_l = st.text_input("Email", key="login_email")
