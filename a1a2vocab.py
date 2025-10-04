@@ -1,4 +1,6 @@
 # streamlit_app.py  — Supabase version (multi-tenant)
+import logging
+
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date
@@ -66,9 +68,14 @@ def auth_screen():
                 st.error("All fields required.")
             else:
                 # 1) Create auth user
-                out = sb.auth.sign_up({"email": email, "password": pw})
+                try:
+                    out = sb.auth.sign_up({"email": email, "password": pw})
+                except AuthApiError as err:
+                    logging.exception("Supabase sign-up failed: %s", err)
+                    st.error("Sign-up failed: email may already exist or confirmation required.")
+                    st.stop()
                 if not out.user:
-                    st.error("Sign-up failed.")
+                    st.error("Sign-up failed: email may already exist or confirmation required.")
                     st.stop()
 
                 # NOTE: if email confirmations are ON, user must confirm before login.
