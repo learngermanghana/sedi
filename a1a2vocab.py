@@ -5,7 +5,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, date
 from supabase import create_client, Client
-from supabase_auth.errors import AuthApiError
+from supabase_auth.errors import AuthApiError, AuthWeakPasswordError, AuthError
 
 # -------------------------------
 # Setup
@@ -14,6 +14,8 @@ st.set_page_config(page_title="Inventory (Supabase)", page_icon="📦", layout="
 url = st.secrets["SUPABASE_URL"]
 key = st.secrets["SUPABASE_ANON_KEY"]
 sb: Client = create_client(url, key)
+
+MIN_PASSWORD_LENGTH = 6
 
 # -------------------------------
 # Helpers
@@ -72,11 +74,17 @@ def auth_screen():
         if st.button("Create my store", type="primary", use_container_width=True):
             if not (store and email and pw):
                 st.error("All fields required.")
+            elif len(pw) < MIN_PASSWORD_LENGTH:
+                st.error(f"Password must be at least {MIN_PASSWORD_LENGTH} characters long.")
             else:
                 # 1) Create auth user
                 try:
                     out = sb.auth.sign_up({"email": email, "password": pw})
-                except AuthApiError as err:
+                except AuthWeakPasswordError as err:
+                    logging.exception("Supabase sign-up failed due to weak password: %s", err)
+                    st.error("Sign-up failed: password is too weak.")
+                    st.stop()
+                except (AuthApiError, AuthError) as err:
                     logging.exception("Supabase sign-up failed: %s", err)
                     st.error("Sign-up failed: email may already exist or confirmation required.")
                     st.stop()
