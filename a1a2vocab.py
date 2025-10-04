@@ -1,10 +1,18 @@
 # streamlit_app.py
 import streamlit as st
+from supabase import create_client, Client
 import sqlite3
 import pandas as pd
 from datetime import datetime, date
 from typing import Optional
 import bcrypt
+
+
+# Initialize Supabase client
+url = st.secrets["SUPABASE_URL"]
+key = st.secrets["SUPABASE_ANON_KEY"]
+supabase: Client = create_client(url, key)
+
 
 DB_PATH = "data.db"
 
