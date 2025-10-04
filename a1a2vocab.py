@@ -15,32 +15,35 @@ sb: Client = create_client(url, key)
 
 MIN_PASSWORD_LENGTH = 6
 
-# -------------------------------
-# Session helpers (ensure PostgREST uses user JWT)
-# -------------------------------
-def attach_tokens(access: str | None, refresh: str | None):
-    if access and refresh:
-        sb.auth.set_session(access_token=access, refresh_token=refresh)
-        sb.postgrest.auth(access)
-    else:
-        sb.postgrest.auth(None)
+# ---- Session helpers (replace your existing versions) ----
+
+def attach_session(sess):
+    # store tokens
+    access = sess.session.access_token
+    refresh = sess.session.refresh_token
+    st.session_state["user"] = {"id": sess.user.id, "email": sess.user.email}
+    st.session_state["jwt"] = access
+    st.session_state["rt"]  = refresh
+    # attach to both auth + postgrest (ONLY if we have tokens)
+    sb.auth.set_session(access_token=access, refresh_token=refresh)
+    sb.postgrest.auth(access)  # <-- no None
 
 def reattach_session():
     access = st.session_state.get("jwt")
     refresh = st.session_state.get("rt")
-    attach_tokens(access, refresh)
+    if access and refresh:
+        sb.auth.set_session(access_token=access, refresh_token=refresh)
+        sb.postgrest.auth(access)  # <-- only when token exists
 
-reattach_session()  # run on every script execution
+# call once near top (after creating sb):
+reattach_session()
 
 def logout():
+    # just clear state; don't call postgrest.auth(None)
     for k in ("user", "jwt", "rt", "org_id", "role"):
         st.session_state.pop(k, None)
-    attach_tokens(None, None)
     st.rerun()
 
-def success_rerun(msg: str):
-    st.success(msg)
-    st.rerun()
 
 # -------------------------------
 # Org & membership
