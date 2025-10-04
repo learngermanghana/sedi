@@ -108,23 +108,6 @@ def auth_screen():
             st.session_state["role"] = memberships[0]["role"]
             st.rerun()
 
-    with tab_login:
-        email_l = st.text_input("Email", key="login_email")
-        pw_l = st.text_input("Password", type="password", key="login_pw")
-        if st.button("Log in", type="primary", use_container_width=True):
-            sess = sb.auth.sign_in_with_password({"email": email_l, "password": pw_l})
-            if sess.user:
-                st.session_state["user"] = {"id": sess.user.id, "email": email_l}
-                memberships = get_user_orgs(sess.user.id)
-                if not memberships:
-                    st.warning("No organization yet. Use 'Create store' first.")
-                    st.stop()
-                st.session_state["org_id"] = memberships[0]["org_id"]
-                st.session_state["role"] = memberships[0]["role"]
-                st.rerun()
-            else:
-                st.error("Invalid email or password.")
-
 # -------------------------------
 # Data access (Supabase)
 # -------------------------------
