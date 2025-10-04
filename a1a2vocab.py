@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, date
 from supabase import create_client, Client
+from supabase_auth.errors import AuthApiError
 
 # -------------------------------
 # Setup
@@ -74,7 +75,11 @@ def auth_screen():
                 # For testing, you can disable confirmations in Supabase Auth settings.
 
                 # 2) Ensure we have an authenticated session for policy-covered inserts
-                sess = sb.auth.sign_in_with_password({"email": email, "password": pw})
+                try:
+                    sess = sb.auth.sign_in_with_password({"email": email, "password": pw})
+                except AuthApiError:
+                    st.error("Auto-login failed after sign-up (email may need confirmation).")
+                    st.stop()
                 if not sess.user:
                     st.error("Auto-login failed after sign-up (email may need confirmation).")
                     st.stop()
@@ -93,7 +98,11 @@ def auth_screen():
         email_l = st.text_input("Email", key="login_email")
         pw_l = st.text_input("Password", type="password", key="login_pw")
         if st.button("Log in", type="primary", use_container_width=True):
-            sess = sb.auth.sign_in_with_password({"email": email_l, "password": pw_l})
+            try:
+                sess = sb.auth.sign_in_with_password({"email": email_l, "password": pw_l})
+            except AuthApiError:
+                st.error("Invalid email or password.")
+                st.stop()
             if not sess.user:
                 st.error("Invalid email or password.")
                 st.stop()
