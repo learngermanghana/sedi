@@ -44,6 +44,16 @@ def logout():
         st.session_state.pop(k, None)
     st.rerun()
 
+def attach_tokens(access: str, refresh: str):
+    # tokens are already in session_state before this is called
+    sb.auth.set_session(access_token=access, refresh_token=refresh)
+    sb.postgrest.auth(access)
+
+def success_rerun(msg: str):
+    st.success(msg)
+    st.rerun()
+
+
 
 # -------------------------------
 # Org & membership
