@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date
@@ -48,12 +49,23 @@ def show_supabase_error(stage: str, err: Exception):
                 pass
     parts.append(f"args: {getattr(err, 'args', None)}")
     st.error("\n".join(str(p) for p in parts))
-    # Still show stack trace locally (Streamlit may redact on Cloud, but it helps locally)
-    st.exception(err)
+    st.exception(err)  # still useful locally
 
 def success_rerun(msg: str):
     st.success(msg)
     st.rerun()
+
+# -------------------------------
+# Email cleaning/validation
+# -------------------------------
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+def clean_email(s: str) -> str:
+    # strip whitespace and common invisible chars
+    return (s or "").strip().replace("\u200b", "").replace("\u00A0", "")
+
+def is_valid_email(s: str) -> bool:
+    return bool(EMAIL_RE.match(s))
 
 # -------------------------------
 # Session helpers
@@ -97,101 +109,6 @@ def create_store_for_logged_in_user(store_name: str) -> str:
         "role": "owner"
     }).execute()
     return org_id
-
-# -------------------------------
-# Auth screen
-# -------------------------------
-def auth_screen():
-    st.title("📦 Inventory (Supabase)")
-    st.caption("Create a store or log in.")
-
-    tab_login, tab_signup = st.tabs(["Log in", "Create store"])
-
-    # --- SIGN UP ---
-    with tab_signup:
-        store = st.text_input("Store name", key="signup_store")
-        email = st.text_input("Owner email", key="signup_email")
-        pw = st.text_input("Password", type="password", key="signup_pw")
-        if st.button("Create my store", type="primary", use_container_width=True, key="btn_create_store"):
-            if not (store and email and pw):
-                st.error("All fields required.")
-                st.stop()
-            if len(pw) < MIN_PASSWORD_LENGTH:
-                st.error(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
-                st.stop()
-
-            # 1) sign up
-            try:
-                out = sb.auth.sign_up({"email": email, "password": pw})
-            except Exception as e:
-                show_supabase_error("Sign-up", e)
-                st.stop()
-            if not out or not out.user:
-                st.error("Sign-up returned no user (email may exist or confirmation required).")
-                st.stop()
-
-            # 2) sign in to get session/JWT (email confirmation may block this if enabled)
-            try:
-                sess = sb.auth.sign_in_with_password({"email": email, "password": pw})
-            except Exception as e:
-                show_supabase_error("Auto-login", e)
-                st.stop()
-            if not sess or not sess.user:
-                st.error("Auto-login returned no user. If email confirmation is enabled, check your inbox.")
-                st.stop()
-
-            # 3) store tokens and attach
-            st.session_state["user"] = {"id": sess.user.id, "email": email}
-            st.session_state["jwt"] = sess.session.access_token
-            st.session_state["rt"] = sess.session.refresh_token
-            attach_tokens(st.session_state["jwt"], st.session_state["rt"])
-
-            # 4) create org + membership
-            try:
-                _ = create_store_for_logged_in_user(store)
-                st.success("Store created. Please log in on the Log in tab.")
-            except Exception as e:
-                show_supabase_error("Post-setup (org creation)", e)
-
-    # --- LOG IN ---
-    with tab_login:
-        email_l = st.text_input("Email", key="login_email")
-        pw_l = st.text_input("Password", type="password", key="login_pw")
-        if st.button("Log in", type="primary", use_container_width=True, key="btn_login"):
-            try:
-                sess = sb.auth.sign_in_with_password({"email": email_l, "password": pw_l})
-            except Exception as e:
-                show_supabase_error("Login", e)
-                st.stop()
-
-            if not sess or not sess.user:
-                st.error("Invalid email or password, or email not confirmed.")
-                st.stop()
-
-            # keep session + attach tokens
-            st.session_state["user"] = {"id": sess.user.id, "email": email_l}
-            st.session_state["jwt"] = sess.session.access_token
-            st.session_state["rt"] = sess.session.refresh_token
-            attach_tokens(st.session_state["jwt"], st.session_state["rt"])
-
-            memberships = get_user_orgs(sess.user.id)
-            if not memberships:
-                st.info("No organization yet. Create one now:")
-                store_name = st.text_input("Store name", key="store_after_login")
-                if st.button("Create my store now", type="primary", key="btn_create_after_login"):
-                    try:
-                        org_id = create_store_for_logged_in_user(store_name)
-                        st.session_state["org_id"] = org_id
-                        st.session_state["role"] = "owner"
-                        st.success("Store created.")
-                        st.rerun()
-                    except Exception as e:
-                        show_supabase_error("Post-login org creation", e)
-                st.stop()
-
-            st.session_state["org_id"] = memberships[0]["org_id"]
-            st.session_state["role"] = memberships[0]["role"]
-            st.rerun()
 
 # -------------------------------
 # Data access (Supabase)
@@ -431,6 +348,113 @@ def page_settings():
     st.write(f"**Role:** {st.session_state.get('role','')}")
     if st.button("Log out", key="btn_logout"):
         logout()
+
+# -------------------------------
+# Auth screen
+# -------------------------------
+def auth_screen():
+    st.title("📦 Inventory (Supabase)")
+    st.caption("Create a store or log in.")
+
+    tab_login, tab_signup = st.tabs(["Log in", "Create store"])
+
+    # --- SIGN UP ---
+    with tab_signup:
+        store = st.text_input("Store name", key="signup_store")
+        raw_email = st.text_input("Owner email", key="signup_email")
+        pw = st.text_input("Password", type="password", key="signup_pw")
+
+        if st.button("Create my store", type="primary", use_container_width=True, key="btn_create_store"):
+            email = clean_email(raw_email)
+
+            if not (store and email and pw):
+                st.error("All fields required.")
+                st.stop()
+            if not is_valid_email(email):
+                st.error("Enter a valid email (e.g., name@example.com).")
+                st.stop()
+            if len(pw) < MIN_PASSWORD_LENGTH:
+                st.error(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
+                st.stop()
+
+            # 1) sign up
+            try:
+                out = sb.auth.sign_up({"email": email, "password": pw})
+            except Exception as e:
+                show_supabase_error("Sign-up", e)
+                st.stop()
+            if not out or not out.user:
+                st.error("Sign-up returned no user (email may exist or confirmation required).")
+                st.stop()
+
+            # 2) sign in to get session/JWT (email confirmation may block this if enabled)
+            try:
+                sess = sb.auth.sign_in_with_password({"email": email, "password": pw})
+            except Exception as e:
+                show_supabase_error("Auto-login", e)
+                st.stop()
+            if not sess or not sess.user:
+                st.error("Auto-login returned no user. If email confirmation is enabled, check your inbox.")
+                st.stop()
+
+            # 3) store tokens and attach
+            st.session_state["user"] = {"id": sess.user.id, "email": email}
+            st.session_state["jwt"] = sess.session.access_token
+            st.session_state["rt"] = sess.session.refresh_token
+            attach_tokens(st.session_state["jwt"], st.session_state["rt"])
+
+            # 4) create org + membership
+            try:
+                _ = create_store_for_logged_in_user(store)
+                st.success("Store created. Please log in on the Log in tab.")
+            except Exception as e:
+                show_supabase_error("Post-setup (org creation)", e)
+
+    # --- LOG IN ---
+    with tab_login:
+        raw_login_email = st.text_input("Email", key="login_email")
+        pw_l = st.text_input("Password", type="password", key="login_pw")
+
+        if st.button("Log in", type="primary", use_container_width=True, key="btn_login"):
+            email_l = clean_email(raw_login_email)
+            if not is_valid_email(email_l):
+                st.error("Enter a valid email (e.g., name@example.com).")
+                st.stop()
+
+            try:
+                sess = sb.auth.sign_in_with_password({"email": email_l, "password": pw_l})
+            except Exception as e:
+                show_supabase_error("Login", e)
+                st.stop()
+
+            if not sess or not sess.user:
+                st.error("Invalid email or password, or email not confirmed.")
+                st.stop()
+
+            # keep session + attach tokens
+            st.session_state["user"] = {"id": sess.user.id, "email": email_l}
+            st.session_state["jwt"] = sess.session.access_token
+            st.session_state["rt"] = sess.session.refresh_token
+            attach_tokens(st.session_state["jwt"], st.session_state["rt"])
+
+            memberships = get_user_orgs(sess.user.id)
+            if not memberships:
+                st.info("No organization yet. Create one now:")
+                store_name = st.text_input("Store name", key="store_after_login")
+                if st.button("Create my store now", type="primary", key="btn_create_after_login"):
+                    try:
+                        org_id = create_store_for_logged_in_user(store_name)
+                        st.session_state["org_id"] = org_id
+                        st.session_state["role"] = "owner"
+                        st.success("Store created.")
+                        st.rerun()
+                    except Exception as e:
+                        show_supabase_error("Post-login org creation", e)
+                st.stop()
+
+            st.session_state["org_id"] = memberships[0]["org_id"]
+            st.session_state["role"] = memberships[0]["role"]
+            st.rerun()
 
 # -------------------------------
 # Main
