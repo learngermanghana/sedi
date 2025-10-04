@@ -1,0 +1,10 @@
+project_id = "your-project-ref"
+
+[db]
+shadow_port = 54320
+port = 54322
+major_version = 15
+schema = ["public", "auth", "storage"]
+
+[migrations]
+dir = "supabase/migrations"
