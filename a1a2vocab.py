@@ -125,11 +125,56 @@ def get_user_orgs(user_id: str) -> List[Dict]:
     return res.data or []
 
 def create_store_for_logged_in_user(store_name: str) -> str:
-    """Creates org (name only) + membership(owner) using current user JWT."""
-    # Belt-and-suspenders: ensure PostgREST has the current JWT *now*
+    """
+    Creates org (name only) + membership(owner) using the current user's JWT.
+    Does NOT require an owner_id column on orgs.
+    """
+    # Ensure PostgREST is using the current JWT *now*
     jwt = st.session_state.get("jwt")
     if jwt:
         sb.postgrest.auth(jwt)
+
+    user_id = st.session_state["user"]["id"]
+
+    # 1) Create the org (no owner_id field assumed)
+    try:
+        org = sb.table("orgs").insert({"name": store_name}).execute()
+    except Exception as e:
+        # Surface useful info from PostgREST/Supabase errors
+        msg = ""
+        code = ""
+        try:
+            # Many Supabase errors put the payload in e.args[0]
+            payload = e.args[0] if e.args else {}
+            msg = (payload.get("message") or "").strip()
+            code = (payload.get("code") or "").strip()
+        except Exception:
+            pass
+        raise Exception(f"Org insert failed (code={code}): {msg}") from e
+
+    org_id = org.data[0]["id"]
+
+    # 2) Create membership for current user (owner)
+    try:
+        sb.table("org_members").insert({
+            "user_id": user_id,
+            "org_id": org_id,
+            "role": "owner",
+        }).execute()
+    except Exception as e:
+        # If membership fails, you may want to delete the org row or show a clear error
+        msg = ""
+        code = ""
+        try:
+            payload = e.args[0] if e.args else {}
+            msg = (payload.get("message") or "").strip()
+            code = (payload.get("code") or "").strip()
+        except Exception:
+            pass
+        raise Exception(f"Membership insert failed (code={code}): {msg}") from e
+
+    return org_id
+
 
     # (Optional) Show identity the DB sees
     check_db_identity()
