@@ -3,7 +3,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, date
 from typing import Optional, List, Dict
-from supabase import create_client, Client
+from supabase import create_client, Client, AuthApiError
 
 # -------------------------------
 # Setup
@@ -405,6 +405,16 @@ def auth_screen():
             # 1) sign up
             try:
                 out = sb.auth.sign_up({"email": email, "password": pw})
+            except AuthApiError as e:
+                msg = getattr(e, "message", "") or getattr(e, "msg", "") or ""
+                code = getattr(e, "code", "") or getattr(e, "error_code", "") or ""
+                normalized = f"{msg} {code}".lower()
+                if "already registered" in normalized or "already exists" in normalized or "user_already_exists" in normalized:
+                    st.info("An account with this email already exists. Please log in instead.")
+                    st.stop()
+                else:
+                    show_supabase_error("Sign-up", e)
+                    st.stop()
             except Exception as e:
                 show_supabase_error("Sign-up", e)
                 st.stop()
