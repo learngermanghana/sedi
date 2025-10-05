@@ -83,8 +83,16 @@ def reattach_session():
     access = st.session_state.get("jwt")
     refresh = st.session_state.get("rt")
     if access and refresh:
-        sb.auth.set_session(access_token=access, refresh_token=refresh)
-        sb.postgrest.auth(access)
+        try:
+            sb.auth.set_session(access_token=access, refresh_token=refresh)
+            sb.postgrest.auth(access)
+        except AuthApiError:
+            for key in ("user", "jwt", "rt", "org_id", "role"):
+                st.session_state.pop(key, None)
+            st.warning("Session expired. Please log in again.")
+        except Exception:
+            for key in ("user", "jwt", "rt", "org_id", "role"):
+                st.session_state.pop(key, None)
 
 def logout():
     """Clear only local state; do not try to unauth PostgREST with None token."""
