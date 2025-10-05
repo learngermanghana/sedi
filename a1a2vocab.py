@@ -16,6 +16,9 @@ sb: Client = create_client(url, key)
 
 MIN_PASSWORD_LENGTH = 6
 
+st.caption(f"Target project host: {url.split('//')[-1]}")
+st.caption(f"Anon key prefix: {key[:10]}… len={len(key)}")
+
 # -------------------------------
 # Diagnostics & helpers
 # -------------------------------
