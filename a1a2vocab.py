@@ -89,6 +89,20 @@ def logout():
         st.session_state.pop(k, None)
     st.rerun()
 
+def check_db_identity():
+    """
+    Optional debug: show who the DB thinks we are.
+    Requires two helper RPCs in DB (safe to try even if missing):
+      whoami() returns uuid; whoami_role() returns text
+    """
+    try:
+        who = sb.rpc("whoami").execute().data
+        role = sb.rpc("whoami_role").execute().data
+        st.info(f"DB sees user: {who}, role: {role}")
+    except Exception:
+        # Silently ignore if RPCs don't exist
+        pass
+
 validate_config()
 reattach_session()
 
@@ -101,8 +115,19 @@ def get_user_orgs(user_id: str) -> List[Dict]:
 
 def create_store_for_logged_in_user(store_name: str) -> str:
     """Creates org (name only) + membership(owner) using current user JWT."""
+    # Belt-and-suspenders: ensure PostgREST has the current JWT *now*
+    jwt = st.session_state.get("jwt")
+    if jwt:
+        sb.postgrest.auth(jwt)
+
+    # (Optional) Show identity the DB sees
+    check_db_identity()
+
+    # 1) create org (INSERT policy should allow any authenticated user)
     org = sb.table("orgs").insert({"name": store_name}).execute()
     org_id = org.data[0]["id"]
+
+    # 2) create membership for current user (org owner)
     sb.table("org_members").insert({
         "user_id": st.session_state["user"]["id"],
         "org_id": org_id,
@@ -281,7 +306,7 @@ def page_receive():
         if qty <= 0:
             st.error("Quantity must be > 0")
         else:
-            receive_stock(org_id, row["id"], qty, unit_cost)
+            receive_stock(org_id, row["id"], unit_cost=unit_cost, qty=qty)
             success_rerun("Receipt recorded.")
 
 def page_sell():
@@ -397,11 +422,15 @@ def auth_screen():
                 st.error("Auto-login returned no user. If email confirmation is enabled, check your inbox.")
                 st.stop()
 
-            # 3) store tokens and attach
+            # 3) store tokens and attach (and reattach to be safe)
             st.session_state["user"] = {"id": sess.user.id, "email": email}
             st.session_state["jwt"] = sess.session.access_token
             st.session_state["rt"] = sess.session.refresh_token
             attach_tokens(st.session_state["jwt"], st.session_state["rt"])
+            reattach_session()
+
+            # Show what DB sees (optional debug)
+            check_db_identity()
 
             # 4) create org + membership
             try:
@@ -431,11 +460,15 @@ def auth_screen():
                 st.error("Invalid email or password, or email not confirmed.")
                 st.stop()
 
-            # keep session + attach tokens
+            # keep session + attach tokens (and reattach)
             st.session_state["user"] = {"id": sess.user.id, "email": email_l}
             st.session_state["jwt"] = sess.session.access_token
             st.session_state["rt"] = sess.session.refresh_token
             attach_tokens(st.session_state["jwt"], st.session_state["rt"])
+            reattach_session()
+
+            # Optional: show identity as seen by DB
+            check_db_identity()
 
             memberships = get_user_orgs(sess.user.id)
             if not memberships:
@@ -443,8 +476,10 @@ def auth_screen():
                 store_name = st.text_input("Store name", key="store_after_login")
                 if st.button("Create my store now", type="primary", key="btn_create_after_login"):
                     try:
-                        org_id = create_store_for_logged_in_user(store_name)
-                        st.session_state["org_id"] = org_id
+                        # Ensure PostgREST auth header is set right now
+                        sb.postgrest.auth(st.session_state["jwt"])
+                        _ = create_store_for_logged_in_user(store_name)
+                        st.session_state["org_id"] = _
                         st.session_state["role"] = "owner"
                         st.success("Store created.")
                         st.rerun()
