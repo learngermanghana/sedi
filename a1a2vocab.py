@@ -16,6 +16,7 @@ sb: Client = create_client(url, key)
 
 MIN_PASSWORD_LENGTH = 6
 
+# (Optional) quick debug so you can confirm the project pointed to by this app
 st.caption(f"Target project host: {url.split('//')[-1]}")
 st.caption(f"Anon key prefix: {key[:10]}… len={len(key)}")
 
@@ -64,7 +65,6 @@ def success_rerun(msg: str):
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
 def clean_email(s: str) -> str:
-    # strip whitespace and common invisible chars
     return (s or "").strip().replace("\u200b", "").replace("\u00A0", "")
 
 def is_valid_email(s: str) -> bool:
@@ -79,7 +79,7 @@ def attach_tokens(access: str, refresh: str):
     sb.postgrest.auth(access)
 
 def reattach_session():
-    """Re-attach tokens on reruns if saved."""
+    """Re-attach tokens on reruns if saved (handle expired sessions)."""
     access = st.session_state.get("jwt")
     refresh = st.session_state.get("rt")
     if access and refresh:
@@ -111,7 +111,6 @@ def check_db_identity():
         role = sb.rpc("whoami_role").execute().data
         st.info(f"DB sees user: {who}, role: {role}")
     except Exception:
-        # Silently ignore if RPCs don't exist
         pass
 
 validate_config()
@@ -141,10 +140,8 @@ def create_store_for_logged_in_user(store_name: str) -> str:
         org = sb.table("orgs").insert({"name": store_name}).execute()
     except Exception as e:
         # Surface useful info from PostgREST/Supabase errors
-        msg = ""
-        code = ""
+        msg = code = ""
         try:
-            # Many Supabase errors put the payload in e.args[0]
             payload = e.args[0] if e.args else {}
             msg = (payload.get("message") or "").strip()
             code = (payload.get("code") or "").strip()
@@ -162,9 +159,7 @@ def create_store_for_logged_in_user(store_name: str) -> str:
             "role": "owner",
         }).execute()
     except Exception as e:
-        # If membership fails, you may want to delete the org row or show a clear error
-        msg = ""
-        code = ""
+        msg = code = ""
         try:
             payload = e.args[0] if e.args else {}
             msg = (payload.get("message") or "").strip()
@@ -175,26 +170,36 @@ def create_store_for_logged_in_user(store_name: str) -> str:
 
     return org_id
 
-
-    # (Optional) Show identity the DB sees
-    check_db_identity()
+def ensure_membership_and_bootstrap(default_store_name: str = "My Store") -> None:
+    """
+    Guarantees the logged-in user has an org + membership in session state.
+    If none exists, creates one and then sets st.session_state['org_id']/['role'].
+    """
+    jwt = st.session_state.get("jwt")
+    if jwt:
+        sb.postgrest.auth(jwt)
 
     user_id = st.session_state["user"]["id"]
 
-    # 1) create org (INSERT policy should allow any authenticated user)
-    org = sb.table("orgs").insert({
-        "name": store_name,
-        "owner_id": user_id,
-    }).execute()
-    org_id = org.data[0]["id"]
+    rows = get_user_orgs(user_id)
+    if not rows:
+        try:
+            create_store_for_logged_in_user(default_store_name)
+        except Exception as e:
+            show_supabase_error("Auto-create org", e)
+            st.stop()
+        # read again (race-safe)
+        rows = get_user_orgs(user_id)
 
-    # 2) create membership for current user (org owner)
-    sb.table("org_members").insert({
-        "user_id": user_id,
-        "org_id": org_id,
-        "role": "owner"
-    }).execute()
-    return org_id
+    if not rows:
+        st.error("Could not find your organization after creating it. "
+                 "Check RLS on org_members (select/insert) so user_id = auth.uid().")
+        check_db_identity()
+        st.stop()
+
+    st.session_state["org_id"] = rows[0]["org_id"]
+    st.session_state["role"] = rows[0]["role"]
+    st.rerun()
 
 # -------------------------------
 # Data access (Supabase)
@@ -454,14 +459,11 @@ def auth_screen():
             email = clean_email(raw_email)
 
             if not (store and email and pw):
-                st.error("All fields required.")
-                st.stop()
+                st.error("All fields required."); st.stop()
             if not is_valid_email(email):
-                st.error("Enter a valid email (e.g., name@example.com).")
-                st.stop()
+                st.error("Enter a valid email (e.g., name@example.com)."); st.stop()
             if len(pw) < MIN_PASSWORD_LENGTH:
-                st.error(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
-                st.stop()
+                st.error(f"Password must be at least {MIN_PASSWORD_LENGTH} characters."); st.stop()
 
             # 1) sign up
             try:
@@ -471,27 +473,23 @@ def auth_screen():
                 code = getattr(e, "code", "") or getattr(e, "error_code", "") or ""
                 normalized = f"{msg} {code}".lower()
                 if "already registered" in normalized or "already exists" in normalized or "user_already_exists" in normalized:
-                    st.info("An account with this email already exists. Please log in instead.")
-                    st.stop()
+                    st.info("An account with this email already exists. Please log in instead."); st.stop()
                 else:
-                    show_supabase_error("Sign-up", e)
-                    st.stop()
+                    show_supabase_error("Sign-up", e); st.stop()
             except Exception as e:
-                show_supabase_error("Sign-up", e)
-                st.stop()
+                show_supabase_error("Sign-up", e); st.stop()
+
             if not out or not out.user:
-                st.error("Sign-up returned no user (email may exist or confirmation required).")
-                st.stop()
+                st.error("Sign-up returned no user (email may exist or confirmation required)."); st.stop()
 
             # 2) sign in to get session/JWT (email confirmation may block this if enabled)
             try:
                 sess = sb.auth.sign_in_with_password({"email": email, "password": pw})
             except Exception as e:
-                show_supabase_error("Auto-login", e)
-                st.stop()
+                show_supabase_error("Auto-login", e); st.stop()
+
             if not sess or not sess.user:
-                st.error("Auto-login returned no user. If email confirmation is enabled, check your inbox.")
-                st.stop()
+                st.error("Auto-login returned no user. If email confirmation is enabled, check your inbox."); st.stop()
 
             # 3) store tokens and attach (and reattach to be safe)
             st.session_state["user"] = {"id": sess.user.id, "email": email}
@@ -500,15 +498,11 @@ def auth_screen():
             attach_tokens(st.session_state["jwt"], st.session_state["rt"])
             reattach_session()
 
-            # Show what DB sees (optional debug)
+            # (Optional) Show what DB sees
             check_db_identity()
 
-            # 4) create org + membership
-            try:
-                _ = create_store_for_logged_in_user(store)
-                st.success("Store created. Please log in on the Log in tab.")
-            except Exception as e:
-                show_supabase_error("Post-setup (org creation)", e)
+            # 4) ensure you have an org + membership and jump into the app
+            ensure_membership_and_bootstrap(default_store_name=store)
 
     # --- LOG IN ---
     with tab_login:
@@ -518,18 +512,15 @@ def auth_screen():
         if st.button("Log in", type="primary", use_container_width=True, key="btn_login"):
             email_l = clean_email(raw_login_email)
             if not is_valid_email(email_l):
-                st.error("Enter a valid email (e.g., name@example.com).")
-                st.stop()
+                st.error("Enter a valid email (e.g., name@example.com)."); st.stop()
 
             try:
                 sess = sb.auth.sign_in_with_password({"email": email_l, "password": pw_l})
             except Exception as e:
-                show_supabase_error("Login", e)
-                st.stop()
+                show_supabase_error("Login", e); st.stop()
 
             if not sess or not sess.user:
-                st.error("Invalid email or password, or email not confirmed.")
-                st.stop()
+                st.error("Invalid email or password, or email not confirmed."); st.stop()
 
             # keep session + attach tokens (and reattach)
             st.session_state["user"] = {"id": sess.user.id, "email": email_l}
@@ -538,29 +529,12 @@ def auth_screen():
             attach_tokens(st.session_state["jwt"], st.session_state["rt"])
             reattach_session()
 
-            # Optional: show identity as seen by DB
+            # (Optional) DB identity
             check_db_identity()
 
-            memberships = get_user_orgs(sess.user.id)
-            if not memberships:
-                st.info("No organization yet. Create one now:")
-                store_name = st.text_input("Store name", key="store_after_login")
-                if st.button("Create my store now", type="primary", key="btn_create_after_login"):
-                    try:
-                        # Ensure PostgREST auth header is set right now
-                        sb.postgrest.auth(st.session_state["jwt"])
-                        _ = create_store_for_logged_in_user(store_name)
-                        st.session_state["org_id"] = _
-                        st.session_state["role"] = "owner"
-                        st.success("Store created.")
-                        st.rerun()
-                    except Exception as e:
-                        show_supabase_error("Post-login org creation", e)
-                st.stop()
-
-            st.session_state["org_id"] = memberships[0]["org_id"]
-            st.session_state["role"] = memberships[0]["role"]
-            st.rerun()
+            # Guarantee membership and jump in (auto-creates a default store if needed)
+            default_name = st.session_state.get("store_after_login") or "My Store"
+            ensure_membership_and_bootstrap(default_store_name=default_name)
 
 # -------------------------------
 # Main
