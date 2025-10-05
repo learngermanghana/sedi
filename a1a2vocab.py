@@ -126,13 +126,18 @@ def create_store_for_logged_in_user(store_name: str) -> str:
     # (Optional) Show identity the DB sees
     check_db_identity()
 
+    user_id = st.session_state["user"]["id"]
+
     # 1) create org (INSERT policy should allow any authenticated user)
-    org = sb.table("orgs").insert({"name": store_name}).execute()
+    org = sb.table("orgs").insert({
+        "name": store_name,
+        "owner_id": user_id,
+    }).execute()
     org_id = org.data[0]["id"]
 
     # 2) create membership for current user (org owner)
     sb.table("org_members").insert({
-        "user_id": st.session_state["user"]["id"],
+        "user_id": user_id,
         "org_id": org_id,
         "role": "owner"
     }).execute()
