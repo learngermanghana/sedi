@@ -1,0 +1,1425 @@
+// functions/index.js
+// Firebase Functions v2 – Node 20
+
+const { onDocumentCreated, onDocumentWritten } = require("firebase-functions/v2/firestore");
+const { onRequest } = require("firebase-functions/v2/https");
+const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { defineSecret } = require("firebase-functions/params");
+const admin = require("firebase-admin");
+const { XMLParser } = require("fast-xml-parser"); // RSS/Atom parsing
+const crypto = require("crypto");
+
+admin.initializeApp();
+const db = admin.firestore();
+
+// ── Secrets ───────────────────────────────────────────────────────────────────
+const BOT_TOKEN       = defineSecret("TELEGRAM_BOT_TOKEN");
+const TEACHER_CHAT_ID = defineSecret("TELEGRAM_CHAT_ID");
+const WEBHOOK_SECRET  = defineSecret("TELEGRAM_WEBHOOK_SECRET"); // optional
+
+// ── Blog feed config ──────────────────────────────────────────────────────────
+const BLOG_FEED_URL = "https://blog.falowen.app/feed.xml";
+const BLOG_COOLDOWN_MS = 3 * 60 * 60 * 1000; // min gap between student broadcasts
+const BLOG_LOOKBACK_DAYS = 14;               // ignore older than N days
+const BLOG_MAX_ITEMS_PER_RUN = 3;            // cap items per digest
+const BLOG_BROADCAST_TO_STUDENTS = true;     // set false to test quietly
+
+const BLOG_STATE_REF = db.collection("integrations").doc("rss_blog");
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function tsToMs(ts) {
+  try {
+    if (typeof ts === "number") return ts > 1e12 ? ts : ts * 1000;
+    if (ts instanceof Date) return ts.getTime();
+    if (ts?.toDate) return ts.toDate().getTime();
+    if (ts?.toMillis) return ts.toMillis();
+    if (ts && typeof ts === "object" && "_seconds" in ts) {
+      return Number(ts._seconds) * 1000 + Math.floor(Number(ts._nanoseconds || 0) / 1e6);
+    }
+    if (typeof ts === "string") return new Date(ts).getTime();
+  } catch (_) {}
+  return 0;
+}
+
+const LEVEL_SESSIONS = { A1: 3, A2: 3, B1: 2, B2: 2 }; // adjust if needed
+
+async function getExpectedSessionsForClass(className) {
+  // 1) Optional meta override: attendance/{className}/meta.expected_per_week
+  try {
+    const metaSnap = await db.collection("attendance").doc(className).collection("meta").doc("config").get();
+    const exp = metaSnap.exists ? Number(metaSnap.data()?.expected_per_week) : NaN;
+    if (Number.isFinite(exp) && exp > 0) return exp;
+  } catch (_) {}
+
+  // 2) Try match from class name (e.g., "A1-...", "B1 Evenings")
+  const m = /^([AB]\d)\b/i.exec(String(className));
+  if (m && LEVEL_SESSIONS[m[1].toUpperCase()]) {
+    return LEVEL_SESSIONS[m[1].toUpperCase()];
+  }
+
+  // 3) Try class_board lookup to infer level (class_board/{level}/classes/{className})
+  try {
+    const levels = Object.keys(LEVEL_SESSIONS);
+    for (const lvl of levels) {
+      const doc = await db.collection("class_board").doc(lvl).collection("classes").doc(className).get();
+      if (doc.exists) return LEVEL_SESSIONS[lvl];
+    }
+  } catch (_) {}
+
+  // 4) Fallback default if unknown
+  return 3;
+}
+
+
+function bestTimeMs(data, meta = {}) {
+  const c = [
+    tsToMs(data.submitted_at),
+    tsToMs(data.timestamp),
+    tsToMs(data.created_at),
+    tsToMs(data.updated_at),
+    meta.updateTime?.toDate?.().getTime?.() || 0,
+    meta.createTime?.toDate?.().getTime?.() || 0,
+  ].filter(Boolean);
+  return c.length ? Math.max(...c) : Date.now();
+}
+
+function pickTitle(data, docId) {
+  const fields = ["title", "lesson", "assignment", "lesson_key", "topic", "name", "subject"];
+  for (const k of fields) {
+    const v = data?.[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return docId || "(no title)";
+}
+
+function fmtTime(ms) {
+  const d = new Date(ms);
+  return d.toISOString().replace("T", " ").slice(0, 19);
+}
+
+/** Try to fetch parent post title for replies. */
+async function getParentPostTitleOrId(commentSnap, fallbackId) {
+  try {
+    const postRef = commentSnap.ref.parent.parent; // .../posts/{postId}
+    if (postRef) {
+      const ps = await postRef.get();
+      const pd = ps.exists ? (ps.data() || {}) : {};
+      const t = pickTitle(pd, fallbackId);
+      if (t) return t;
+    }
+  } catch (_) {}
+  return fallbackId || "(post)";
+}
+
+/** Roster lookups used by name resolution */
+async function nameFromRosterByCode(code) {
+  try {
+    const snap = await db.collection("roster").doc(String(code)).get();
+    if (!snap.exists) return "";
+    const r = snap.data() || {};
+    return (r.name || r.full_name || r.student_name || r.display_name || "").toString().trim();
+  } catch (_) { return ""; }
+}
+async function nameFromRosterByField(field, value) {
+  try {
+    const q = await db.collection("roster").where(field, "==", value).limit(1).get();
+    if (q.empty) return "";
+    const r = q.docs[0].data() || {};
+    return (r.name || r.full_name || r.student_name || r.display_name || "").toString().trim();
+  } catch (_) { return ""; }
+}
+
+
+// ── Natural-language student code capture ────────────────────────────────────
+function extractStudentCode(raw) {
+  if (!raw) return null;
+  const text = String(raw).trim();
+
+  // 1) direct-code message, e.g., "LG-12345" or "abc_123"
+  const direct = /^[A-Za-z0-9][A-Za-z0-9._:-]{2,}$/; // min 3 chars, allows -, _, ., :
+  if (direct.test(text)) return text;
+
+  // 2) natural phrases: "my code is ABC-123", "student code: GH_2024", "register 12345"
+  const m = /(student\s*code|my\s*code|code|register|link|join)\s*(is|=|:)?\s*([A-Za-z0-9][A-Za-z0-9._:-]{2,})/i.exec(text);
+  if (m && m[3]) return m[3].trim();
+
+  return null;
+}
+
+// ── Quick reply keyboard helpers (Telegram ReplyKeyboard) ────────────────────
+function replyKb(rows) {
+  return {
+    keyboard: rows,
+    resize_keyboard: true,
+    one_time_keyboard: true,
+  };
+}
+function removeKb() {
+  return { remove_keyboard: true };
+}
+
+
+// Parse a score into percent. Accepts "85", "85%", "18/20", numbers, etc.
+function toPercent(score) {
+  if (score === undefined || score === null) return null;
+  const s = String(score).trim();
+
+  // 1) 18/20 style
+  const frac = /^(-?\d+(?:\.\d+)?)\s*\/\s*(-?\d+(?:\.\d+)?)$/.exec(s);
+  if (frac) {
+    const got = Number(frac[1]), max = Number(frac[2]);
+    if (isFinite(got) && isFinite(max) && max > 0) {
+      return Math.round((got / max) * 100);
+    }
+  }
+
+  // 2) 85% or 85
+  const num = parseFloat(s.replace('%',''));
+  if (isFinite(num)) {
+    return Math.round(num > 1 && num <= 100 ? num : (num <= 1 ? num * 100 : num));
+  }
+
+  return null;
+}
+
+
+// ── Safer HTML + text helpers ────────────────────────────────────────────────
+function htmlEscape(str = "") {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+function truncHtml(text = "", max = 3500) {
+  const s = String(text);
+  return s.length <= max ? s : s.slice(0, max - 1) + "…";
+}
+function stripTags(html = "", max = 240) {
+  const txt = String(html).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  return txt.length <= max ? txt : txt.slice(0, max - 1) + "…";
+}
+function safeLine(label, value) {
+  const v = (value ?? "").toString().trim();
+  return v ? `<b>${htmlEscape(label)}:</b> ${htmlEscape(v)}` : "";
+}
+function sha1(s) {
+  return crypto.createHash("sha1").update(String(s)).digest("hex");
+}
+function isWithinQuietHours(date = new Date()) {
+  // Africa/Accra = UTC+0. Send between 08:00–21:00.
+  const h = date.getUTCHours();
+  return !(h >= 8 && h < 21);
+}
+
+// ── Telegram senders (text + photo) with retries & rate-limit ────────────────
+async function sendTelegramText(chatId, text, opts = {}) {
+  const token = BOT_TOKEN.value();
+  const url = `https://api.telegram.org/bot${token}/sendMessage`;
+  const body = {
+    chat_id: chatId,
+    text: truncHtml(text, 3900),   // headroom for markup, TG limit ~4096
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    ...opts,
+  };
+
+  const maxAttempts = 5;
+  let delay = 300; // ms
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        let retryAfterMs = 0;
+        let payload = null;
+        try { payload = await res.json(); } catch (_) {}
+        if (payload?.parameters?.retry_after) retryAfterMs = Number(payload.parameters.retry_after) * 1000;
+
+        if (res.status >= 400 && res.status < 500 && res.status !== 429) {
+          console.error("Telegram 4xx:", res.status, payload?.description);
+          return false;
+        }
+        if (res.status === 429 && retryAfterMs) {
+          await new Promise(r => setTimeout(r, retryAfterMs));
+          continue;
+        }
+        await new Promise(r => setTimeout(r, delay));
+        delay = Math.min(delay * 2, 5000);
+        continue;
+      }
+
+      const j = await res.json().catch(() => null);
+      return j?.ok === true;
+    } catch (e) {
+      console.error("sendTelegramText attempt error:", e?.message || e);
+      await new Promise(r => setTimeout(r, delay));
+      delay = Math.min(delay * 2, 5000);
+    }
+  }
+  return false;
+}
+
+async function sendTelegramPhoto(chatId, photoUrl, caption = "", opts = {}) {
+  const token = BOT_TOKEN.value();
+  const url = `https://api.telegram.org/bot${token}/sendPhoto`;
+  const body = {
+    chat_id: chatId,
+    photo: photoUrl,
+    caption: truncHtml(caption, 1000), // Telegram caption hard limit ~1024
+    parse_mode: "HTML",
+    disable_notification: true,
+    ...opts,
+  };
+
+  const maxAttempts = 5;
+  let delay = 300;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        let retryAfterMs = 0;
+        let payload = null;
+        try { payload = await res.json(); } catch (_) {}
+        if (payload?.parameters?.retry_after) retryAfterMs = Number(payload.parameters.retry_after) * 1000;
+
+        if (res.status >= 400 && res.status < 500 && res.status !== 429) {
+          console.error("Telegram sendPhoto 4xx:", res.status, payload?.description);
+          return false;
+        }
+        if (res.status === 429 && retryAfterMs) {
+          await new Promise(r => setTimeout(r, retryAfterMs));
+          continue;
+        }
+        await new Promise(r => setTimeout(r, delay));
+        delay = Math.min(delay * 2, 5000);
+        continue;
+      }
+
+      const j = await res.json().catch(() => null);
+      return j?.ok === true;
+    } catch (e) {
+      console.error("sendTelegramPhoto attempt error:", e?.message || e);
+      await new Promise(r => setTimeout(r, delay));
+      delay = Math.min(delay * 2, 5000);
+    }
+  }
+  return false;
+}
+
+async function notifyTeacher(lines) {
+  const chatId = TEACHER_CHAT_ID.value();
+  if (!chatId) return;
+  const text = Array.isArray(lines) ? lines.join("\n") : String(lines);
+  await sendTelegramText(chatId, text);
+}
+async function notifyTeacherPhoto(photoUrl, caption) {
+  const chatId = TEACHER_CHAT_ID.value();
+  if (!chatId) return;
+  const ok = await sendTelegramPhoto(chatId, photoUrl, caption);
+  if (!ok) {
+    await notifyTeacher([caption, `\n(Image failed: ${htmlEscape(photoUrl)})`]);
+  }
+}
+
+// ── Student code lookup & recipient mapping ──────────────────────────────────
+/** Find a student's Telegram chat_id by student_code. */
+async function chatIdForStudentCode(code) {
+  if (!code) return null;
+
+  try {
+    const r = await db.collection("roster").doc(String(code)).get();
+    if (r.exists && r.data()?.chat_id) return r.data().chat_id;
+  } catch (_) {}
+
+  try {
+    const q = await db
+      .collection("telegram_users")
+      .where("student_code", "==", String(code))
+      .where("active", "==", true)
+      .limit(1)
+      .get();
+    if (!q.empty) return q.docs[0].data()?.chat_id || null;
+  } catch (_) {}
+
+  return null;
+}
+
+async function mapCodesToRecipients(codes, concurrency = 20) {
+  const arr = Array.from(codes);
+  const out = [];
+  let i = 0;
+
+  async function worker() {
+    while (i < arr.length) {
+      const code = arr[i++];
+      try {
+        const chatId = await chatIdForStudentCode(code);
+        if (chatId) out.push({ code, chatId });
+      } catch (e) {
+        console.error("mapCodesToRecipients error:", code, e?.message || e);
+      }
+    }
+  }
+
+  await Promise.allSettled(Array.from({ length: Math.min(concurrency, arr.length) }, worker));
+  return out;
+}
+
+/** Get recipients (chat_id + code) for a class. Tries members subcollections; falls back to roster. */
+async function getClassRecipients(level, className) {
+  const codes = new Set();
+
+  // 1) New structure: class_board/{level}/classes/{className}/members/*
+  if (level && className) {
+    try {
+      const s = await db
+        .collection("class_board").doc(String(level))
+        .collection("classes").doc(String(className))
+        .collection("members")
+        .get();
+      s.forEach(d => {
+        const code = d.data()?.student_code || d.id;
+        if (code) codes.add(String(code));
+      });
+    } catch (_) {}
+  }
+
+  // 2) Legacy structure: class_board/{className}/members/*
+  if (codes.size === 0 && className) {
+    try {
+      const s = await db
+        .collection("class_board").doc(String(className))
+        .collection("members")
+        .get();
+      s.forEach(d => {
+        const code = d.data()?.student_code || d.id;
+        if (code) codes.add(String(code));
+      });
+    } catch (_) {}
+  }
+
+  // 3) Fallback from roster (try exact class, then "level:class")
+  if (codes.size === 0 && className) {
+    try {
+      const q1 = await db.collection("roster")
+        .where("class_board", "==", String(className)).get();
+      q1.forEach(d => codes.add(String(d.data()?.student_code || d.id)));
+    } catch (_) {}
+  }
+  if (codes.size === 0 && level && className) {
+    try {
+      const key = `${level}:${className}`;
+      const q2 = await db.collection("roster")
+        .where("class_board", "==", key).get();
+      q2.forEach(d => codes.add(String(d.data()?.student_code || d.id)));
+    } catch (_) {}
+  }
+
+  return mapCodesToRecipients(codes);
+}
+
+/** Broadcast text to a class; bounded concurrency to avoid rate limits */
+async function broadcastToClass(level, className, text) {
+  const recips = await getClassRecipients(level, className);
+  if (recips.length === 0) return [];
+
+  const chunkSize = 25;
+  for (let i = 0; i < recips.length; i += chunkSize) {
+    const slice = recips.slice(i, i + chunkSize);
+    await Promise.allSettled(slice.map(r => sendTelegramText(r.chatId, text)));
+  }
+  return recips.map(r => r.code);
+}
+
+// ── Blog helpers (state, parsing, images, queue, broadcast) ──────────────────
+async function readBlogState() {
+  try {
+    const snap = await BLOG_STATE_REF.get();
+    return snap.exists ? (snap.data() || {}) : {};
+  } catch { return {}; }
+}
+async function writeBlogState(patch) {
+  await BLOG_STATE_REF.set(
+    { ...patch, updated_at: admin.firestore.FieldValue.serverTimestamp() },
+    { merge: true }
+  );
+}
+
+function tryResolveUrl(src, base) {
+  try { return new URL(src, base).toString(); } catch { return null; }
+}
+function extractImgFromHtml(html, baseLink) {
+  if (!html) return null;
+  const m = String(html).match(/<img[^>]+src=["']([^"']+)["']/i);
+  if (!m) return null;
+  return tryResolveUrl(m[1], baseLink) || m[1];
+}
+function firstImageFromItem(it) {
+  const link =
+    it.link?.["@_href"] ||
+    (Array.isArray(it.link) ? it.link.find(l => l?.["@_rel"] === "alternate")?.["@_href"] : null) ||
+    it.link || "";
+
+  // media:content
+  const mediaContent = it["media:content"];
+  if (mediaContent) {
+    const arr = Array.isArray(mediaContent) ? mediaContent : [mediaContent];
+    for (const mc of arr) {
+      const url = mc?.["@_url"] || mc?.["@_src"];
+      const type = mc?.["@_type"] || "";
+      if (url && (!type || /^image\//i.test(type))) {
+        const resolved = tryResolveUrl(url, link);
+        if (resolved) return resolved;
+      }
+    }
+  }
+  // media:thumbnail
+  const mediaThumb = it["media:thumbnail"];
+  if (mediaThumb) {
+    const arr = Array.isArray(mediaThumb) ? mediaThumb : [mediaThumb];
+    for (const mt of arr) {
+      const url = mt?.["@_url"] || mt?.["@_src"];
+      if (url) {
+        const resolved = tryResolveUrl(url, link);
+        if (resolved) return resolved;
+      }
+    }
+  }
+  // enclosure
+  const enclosure = it.enclosure;
+  if (enclosure) {
+    const arr = Array.isArray(enclosure) ? enclosure : [enclosure];
+    for (const en of arr) {
+      const type = en?.["@_type"] || en?.type || "";
+      const url = en?.["@_url"] || en?.url;
+      if (url && /^image\//i.test(type || "")) {
+        const resolved = tryResolveUrl(url, link);
+        if (resolved) return resolved;
+      }
+    }
+  }
+  // fallback from HTML
+  const html = it["content:encoded"] || it.description || it.summary || "";
+  const fromHtml = extractImgFromHtml(html, link);
+  return fromHtml || null;
+}
+
+async function fetchBlogFeed() {
+  const res = await fetch(BLOG_FEED_URL, { method: "GET", headers: { "accept": "application/xml,text/xml,*/*" } });
+  if (!res.ok) throw new Error(`Feed HTTP ${res.status}`);
+  const xml = await res.text();
+
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: "@_",
+    trimValues: true,
+  });
+  const j = parser.parse(xml);
+
+  // raw feed items (RSS/Atom)
+  const raw = (j?.rss?.channel?.item || j?.feed?.entry || []);
+
+  // Normalize to objects with an image URL resolved
+  return raw.map((it) => {
+    const title = it.title?.["#text"] || it.title || "(untitled)";
+    const link =
+      it.link?.["@_href"] ||
+      (Array.isArray(it.link) ? it.link.find(l => l?.["@_rel"] === "alternate")?.["@_href"] : null) ||
+      it.link ||
+      it.guid?.["#text"] ||
+      it.guid ||
+      "";
+    const id = String(
+      it.guid?.["@_isPermaLink"] ? it.guid?.["#text"] :
+      it.guid?.["#text"] || it.guid || it.id || link || title
+    );
+    const pub =
+      it.pubDate || it.published || it.updated || it["dc:date"] || it["atom:updated"] || null;
+    const dateMs = tsToMs(pub) || 0;
+    const summary = stripTags(it.description || it.summary || it["content:encoded"] || "", 260);
+    const image = firstImageFromItem(it) || null;
+    return { id, title, link, dateMs, summary, image };
+  });
+}
+
+async function getAllActiveBlogSubscribers() {
+  const q = await db.collection("telegram_users")
+    .where("active", "==", true)
+    .limit(1000) // paginate if needed later
+    .get();
+
+  const users = [];
+  q.forEach(d => {
+    const data = d.data() || {};
+    if (data.blog_opt_out === true) return;
+    if (data.chat_id) users.push(String(data.chat_id));
+  });
+  return users;
+}
+
+async function broadcastToAllActive(text, { silent = true } = {}) {
+  const subs = await getAllActiveBlogSubscribers();
+  if (!subs.length) return 0;
+
+  const chunkSize = 25;
+  let delivered = 0;
+  for (let i = 0; i < subs.length; i += chunkSize) {
+    const slice = subs.slice(i, i + chunkSize);
+    const results = await Promise.allSettled(
+      slice.map(cid => sendTelegramText(cid, text, { disable_notification: silent }))
+    );
+    delivered += results.filter(r => r.status === "fulfilled").length;
+  }
+  return delivered;
+}
+
+async function broadcastToAllActivePhoto(photoUrl, caption, { silent = true } = {}) {
+  const subs = await getAllActiveBlogSubscribers();
+  if (!subs.length) return 0;
+
+  const chunkSize = 15; // smaller batches for media
+  let delivered = 0;
+  for (let i = 0; i < subs.length; i += chunkSize) {
+    const slice = subs.slice(i, i + chunkSize);
+    const results = await Promise.allSettled(
+      slice.map(cid => sendTelegramPhoto(cid, photoUrl, caption, { disable_notification: silent }))
+    );
+    delivered += results.filter(r => r.status === "fulfilled").length;
+  }
+  return delivered;
+}
+
+// ── Queue helpers for blog updates ───────────────────────────────────────────
+function itemHash(p){ return sha1(p.id || p.link); }
+function dedupByHash(list){
+  const seen = new Set();
+  const out = [];
+  for (const it of list){
+    const h = itemHash(it);
+    if (h && !seen.has(h)){ seen.add(h); out.push(it); }
+  }
+  return out;
+}
+
+// ── 1) Final submissions → teacher notification only ─────────────────────────
+exports.onFinalSubmission = onDocumentWritten(
+  {
+    region: "us-central1",
+    document: "submissions/{level}/posts/{postId}",
+    secrets: [BOT_TOKEN, TEACHER_CHAT_ID],
+  },
+  async (event) => {
+    const after = event.data?.after?.data();
+    if (!after) return; // deleted
+
+    const before = event.data?.before?.data();
+    const statusNow = (after.status || "").toLowerCase();
+    const statusWas = (before?.status || "").toLowerCase();
+
+    const becameFinal = statusNow === "submitted" && (!before || statusWas !== "submitted");
+    if (!becameFinal) return;
+
+    const ms = bestTimeMs(after, event.data?.after);
+    const title = pickTitle(after, event.params.postId);
+    const studentName = after.student_name || after.name || "(unknown)";
+    const studentCode = after.student_code || "(unknown)";
+    const level = after.level || event.params.level || "(level?)";
+
+    await notifyTeacher([
+      "📥 <b>New final submission</b>",
+      safeLine("Title", title),
+      safeLine("Student", `${studentName} (${studentCode})`),
+      safeLine("Level", level),
+      safeLine("Time", fmtTime(ms)),
+    ]);
+  }
+);
+
+// ── Minimal helpers used below ───────────────────────────────────────────────
+function getAnyCodeFromData(data = {}) {
+  const candidates = [
+    // prefer explicit fields
+    data.asked_by_code, data.replied_by_code,
+    // other fallbacks
+    data.student_code, data.author_code, data.studentcode, data.code, data.author // sometimes holds a code
+  ];
+  for (const v of candidates) {
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
+}
+function maskCode(code, visible = 4) {
+  const s = String(code || "").replace(/\s+/g, "");
+  if (!s) return "";
+  if (s.length <= visible) return htmlEscape(s);
+  return htmlEscape(s.slice(0, visible) + "…");
+}
+
+/** Name resolver now aware of asked_by_* and replied_by_* */
+async function resolveDisplayNameFromData(data) {
+  // 1) direct name fields on the doc
+  const nameCandidates = [
+    data.asked_by_name, data.replied_by_name,
+    data.student_name, data.author_name, data.author_display,
+    data.display_name, data.name, data.nickname
+  ].map(v => (typeof v === "string" ? v.trim() : "")).filter(Boolean);
+  if (nameCandidates.length) return nameCandidates[0];
+
+  // 2) try codes → roster/{code}
+  const codeCandidates = [
+    data.asked_by_code, data.replied_by_code,
+    data.student_code, data.author_code, data.studentcode, data.code, data.author
+  ].map(v => (typeof v === "string" ? v.trim() : "")).filter(Boolean);
+  for (const code of codeCandidates) {
+    const name = await nameFromRosterByCode(code); // you already have this helper
+    if (name) return name;
+  }
+
+  // 3) uid/email/phone → roster query
+  const uidCandidates = [data.uid, data.user_id, data.author_uid, data.created_by]
+    .map(v => (typeof v === "string" ? v.trim() : "")).filter(Boolean);
+  for (const uid of uidCandidates) {
+    const name = await nameFromRosterByField("uid", uid); // existing helper
+    if (name) return name;
+  }
+
+  const emailCandidates = [data.email, data.author_email, data.user_email]
+    .map(v => (typeof v === "string" ? v.trim() : "")).filter(Boolean);
+  for (const email of emailCandidates) {
+    const name = await nameFromRosterByField("email", email.toLowerCase());
+    if (name) return name;
+  }
+
+  const phoneCandidates = [data.phone, data.author_phone, data.user_phone]
+    .map(v => (typeof v === "string" ? v.trim() : "")).filter(Boolean);
+  for (const phone of phoneCandidates) {
+    const name = await nameFromRosterByField("phone", phone);
+    if (name) return name;
+  }
+
+  return "";
+}
+
+// ── 2A) Class-board POST (legacy path) ───────────────────────────────────────
+exports.onClassBoardPost = onDocumentCreated(
+  {
+    region: "us-central1",
+    document: "class_board/{className}/posts/{postId}",
+    secrets: [BOT_TOKEN, TEACHER_CHAT_ID],
+  },
+  async (event) => {
+    const data = event.data?.data() || {};
+    const className = event.params.className;
+    const title = pickTitle(data, event.params.postId);
+
+    // Name (student-facing). If missing, show masked code hint (e.g., "ID LG-20…").
+    const authorName = data.asked_by_name || data.student_name || data.name || "";
+    const codePreview = !authorName ? (data.asked_by_code || getAnyCodeFromData(data)) : "";
+    const displayName = authorName || (codePreview ? `ID ${maskCode(codePreview)}` : "");
+
+    // Fallback (may include code) for teacher log only
+    const by = data.asked_by_name || data.student_name || data.asked_by_code || data.student_code || "(unknown)";
+
+    const text =
+      `🛎️ <b>${htmlEscape(className)}</b>\n` +
+      `New post: <b>${htmlEscape(title)}</b>\n` +
+      (displayName ? `By: <b>${htmlEscape(displayName)}</b>\n` : "") +
+      (data.topic ? `Topic: ${htmlEscape(data.topic)}\n` : "") +
+      (data.content ? `${truncHtml(htmlEscape(data.content), 1200)}\n` : "") +
+      `\nOpen the app → My Course → Classroom → "Class Notes &amp; Q&amp;A"`;
+
+    const codes = await broadcastToClass(undefined, className, text);
+
+    const sample = codes.slice(0, 30).join(", ");
+    await notifyTeacher([
+      "🧾 <b>Class board post</b> (legacy path)",
+      safeLine("Class", className),
+      safeLine("Title", title),
+      safeLine("By", by), // teacher sees this (may include code)
+      safeLine("Recipients", String(codes.length)),
+      codes.length ? `<b>Codes:</b> ${htmlEscape(sample)}${codes.length > 30 ? " …" : ""}` : "",
+    ].filter(Boolean));
+  }
+);
+
+// ── 2B) Class-board POST (nested level/class path) ───────────────────────────
+exports.onClassBoardPostNested = onDocumentCreated(
+  {
+    region: "us-central1",
+    document: "class_board/{level}/classes/{className}/posts/{postId}",
+    secrets: [BOT_TOKEN, TEACHER_CHAT_ID],
+  },
+  async (event) => {
+    const data = event.data?.data() || {};
+    const { level, className } = event.params;
+    const title = pickTitle(data, event.params.postId);
+
+    const authorName = data.asked_by_name || data.student_name || data.name || "";
+    const codePreview = !authorName ? (data.asked_by_code || getAnyCodeFromData(data)) : "";
+    const displayName = authorName || (codePreview ? `ID ${maskCode(codePreview)}` : "");
+
+    const by = data.asked_by_name || data.student_name || data.asked_by_code || data.student_code || "(unknown)";
+
+    const text =
+      `🛎️ <b>${htmlEscape(className)}</b>\n` +
+      `New post: <b>${htmlEscape(title)}</b>\n` +
+      (displayName ? `By: <b>${htmlEscape(displayName)}</b>\n` : "") +
+      (data.topic ? `Topic: ${htmlEscape(data.topic)}\n` : "") +
+      (data.content ? `${truncHtml(htmlEscape(data.content), 1200)}\n` : "") +
+      `\nOpen the app → My Course → Classroom → "Class Notes &amp; Q&amp;A"`;
+
+    const codes = await broadcastToClass(level, className, text);
+
+    const sample = codes.slice(0, 30).join(", ");
+    await notifyTeacher([
+      "🧾 <b>Class board post</b>",
+      safeLine("Level/Class", `${level} / ${className}`),
+      safeLine("Title", title),
+      safeLine("By", by), // teacher sees this (may include code)
+      safeLine("Recipients", String(codes.length)),
+      codes.length ? `<b>Codes:</b> ${htmlEscape(sample)}${codes.length > 30 ? " …" : ""}` : "",
+    ].filter(Boolean));
+  }
+);
+
+// ── 2C) Class-board REPLY (nested path) ──────────────────────────────────────
+exports.onClassBoardReply = onDocumentCreated(
+  {
+    region: "us-central1",
+    document: "class_board/{level}/classes/{className}/posts/{postId}/comments/{commentId}",
+    secrets: [BOT_TOKEN, TEACHER_CHAT_ID],
+  },
+  async (event) => {
+    const data = event.data?.data() || {};
+    const { level, className, postId } = event.params;
+
+    const authorName = data.replied_by_name || await resolveDisplayNameFromData(data);
+    const codePreview = !authorName ? (data.replied_by_code || getAnyCodeFromData(data)) : "";
+    const displayName = authorName || (codePreview ? `ID ${maskCode(codePreview)}` : "A classmate"); // student-facing
+
+    const byForLog =
+      data.replied_by_name || data.asked_by_name || data.student_name ||
+      data.replied_by_code || data.asked_by_code || data.student_code ||
+      data.uid || data.user_id || data.email || data.phone || "(unknown)";
+
+    const postTitle = await getParentPostTitleOrId(event.data, postId);
+    const snippet = (data.text || data.content || "").toString();
+
+    const text =
+      `💬 <b>${htmlEscape(className)}</b>\n` +
+      `New reply on <b>${htmlEscape(postTitle)}</b> by <b>${htmlEscape(displayName)}</b>\n\n` +
+      (snippet ? `${truncHtml(htmlEscape(snippet), 1200)}\n\n` : "") +
+      `Open the app → My Course → Classroom → "Class Notes &amp; Q&amp;A"`;
+
+    const codes = await broadcastToClass(level, className, text);
+
+    const sample = codes.slice(0, 30).join(", ");
+    await notifyTeacher([
+      "💬 <b>Class board reply</b>",
+      safeLine("Level/Class", `${level} / ${className}`),
+      safeLine("Post", `${postId} (${postTitle})`),
+      safeLine("By", byForLog),
+      safeLine("Recipients", String(codes.length)),
+      codes.length ? `<b>Codes:</b> ${htmlEscape(sample)}${codes.length > 30 ? " …" : ""}` : "",
+      "",
+      authorName ? "" : "<i>(No name fields present on comment; tried roster lookups)</i>"
+    ].filter(Boolean));
+  }
+);
+
+// ── 2D) Class-board REPLY (legacy path) ──────────────────────────────────────
+exports.onClassBoardReplyLegacy = onDocumentCreated(
+  {
+    region: "us-central1",
+    document: "class_board/{className}/posts/{postId}/comments/{commentId}",
+    secrets: [BOT_TOKEN, TEACHER_CHAT_ID],
+  },
+  async (event) => {
+    const data = event.data?.data() || {};
+    const { className, postId } = event.params;
+
+    const authorName = data.replied_by_name || await resolveDisplayNameFromData(data);
+    const codePreview = !authorName ? (data.replied_by_code || getAnyCodeFromData(data)) : "";
+    const displayName = authorName || (codePreview ? `ID ${maskCode(codePreview)}` : "A classmate"); // student-facing
+
+    const byForLog =
+      data.replied_by_name || data.asked_by_name || data.student_name ||
+      data.replied_by_code || data.asked_by_code || data.student_code ||
+      data.uid || data.user_id || data.email || data.phone || "(unknown)";
+
+    const postTitle = await getParentPostTitleOrId(event.data, postId);
+    const snippet = (data.text || data.content || "").toString();
+
+    const text =
+      `💬 <b>${htmlEscape(className)}</b>\n` +
+      `New reply on <b>${htmlEscape(postTitle)}</b> by <b>${htmlEscape(displayName)}</b>\n\n` +
+      (snippet ? `${truncHtml(htmlEscape(snippet), 1200)}\n\n` : "") +
+      `Open the app → My Course → Classroom → "Class Notes &amp; Q&amp;A"`;
+
+    const codes = await broadcastToClass(undefined, className, text);
+
+    const sample = codes.slice(0, 30).join(", ");
+    await notifyTeacher([
+      "💬 <b>Class board reply</b> (legacy path)",
+      safeLine("Class", className),
+      safeLine("Post", `${postId} (${postTitle})`),
+      safeLine("By", byForLog),
+      safeLine("Recipients", String(codes.length)),
+      codes.length ? `<b>Codes:</b> ${htmlEscape(sample)}${codes.length > 30 ? " …" : ""}` : "",
+      "",
+      authorName ? "" : "<i>(No name fields present on comment; tried roster lookups)</i>"
+    ].filter(Boolean));
+  }
+);
+
+
+// ── 3) Scores (flat collection) → DM student with pass/fail & guidance ───────
+exports.onScoreCreatedFlat = onDocumentCreated(
+  {
+    region: "us-central1",
+    document: "scores/{scoreId}",
+    secrets: [BOT_TOKEN, TEACHER_CHAT_ID],
+  },
+  async (event) => {
+    const d = event.data?.data() || {};
+    const code   = (d.studentcode || d.student_code || "").toString().trim();
+    if (!code) return;
+
+    const title  = (d.assignment || d.title || "(untitled)").toString().trim();
+    const scoreV = d.score ?? d.result ?? d.marks ?? "";           // be flexible
+    const level  = (d.level || "").toString();
+    const date   = (d.date || "").toString();
+    const link   = (d.link || d.attachment || "").toString();
+
+    // Try to surface any feedback we can find
+    const feedback =
+      (d.feedback && String(d.feedback)) ||
+      (d.tutor_feedback && String(d.tutor_feedback)) ||
+      (d.comments && String(d.comments)) ||
+      "";
+
+    const pct = toPercent(scoreV);
+    const passMark = 60;
+    const passed = pct !== null ? pct >= passMark : null;
+
+    const chatId = await chatIdForStudentCode(code);
+    if (!chatId) return; // student not registered → skip quietly
+
+    // Header and score lines
+    const lines = [
+      "📊 <b>Your result is ready</b>",
+      safeLine("Assignment", title),
+      scoreV !== "" ? safeLine("Score", String(scoreV)) : "",
+      pct !== null ? safeLine("Percent", `${pct}%`) : "",
+      date ? safeLine("Date", date) : "",
+      level ? safeLine("Level", level) : "",
+    ];
+
+    // Pass / Fail block
+    if (passed === true) {
+      lines.push(
+        "",
+        "🎉 <b>Great job!</b> You <b>passed</b>. Keep up the consistency! 💪"
+      );
+    } else if (passed === false) {
+      lines.push(
+        "",
+        "🌱 <b>Keep going!</b> You can improve this. Try these steps:",
+        "• Review the relevant pages in your <b>Coursebook</b>.",
+        "• Read the <b>tutor feedback</b> in <b>My Results &amp; Resources</b>.",
+        "• Make corrections and <b>resubmit</b>.",
+        "",
+        "<b>How to resubmit</b>",
+        "Go to the <b>same place</b> you submitted your work.",
+        "You’ll see a <b>Resubmit</b> button above the box where you typed."
+      );
+    }
+
+    // Inline feedback (if we have it)
+    if (feedback) {
+      lines.push(
+        "",
+        "<b>Tutor feedback</b>",
+        htmlEscape(feedback)
+      );
+    }
+
+    // Attachment (if any)
+    if (link) {
+      lines.push("", `<a href="${htmlEscape(link)}">View attachment</a>`);
+    }
+
+    // Portal link
+    lines.push(
+      "",
+      "For full feedback &amp; references:",
+      "• My Results &amp; Resources → https://www.falowen.app/?tab=My+Results+and+Resources"
+    );
+
+    const msg = lines.filter(Boolean).join("\n");
+
+    const delivered = await sendTelegramText(chatId, msg);
+    if (delivered) {
+      await notifyTeacher([
+        "✅ Score DM delivered",
+        safeLine("Student", code),
+        safeLine("Assignment", title),
+        scoreV !== "" ? safeLine("Score", String(scoreV)) : "",
+        pct !== null ? safeLine("Percent", `${pct}%`) : "",
+        passed === true ? "Result: <b>PASS</b>" : (passed === false ? "Result: <b>TRY AGAIN</b>" : "")
+      ].filter(Boolean));
+    }
+  }
+);
+
+
+// ── 4) Attendance sessions → DM present; add session_ts for weekly summary ───
+exports.onAttendanceSession = onDocumentWritten(
+  {
+    region: "us-central1",
+    document: "attendance/{className}/sessions/{sessionId}",
+    secrets: [BOT_TOKEN, TEACHER_CHAT_ID],
+  },
+  async (event) => {
+    const after = event.data?.after?.data();
+    if (!after) return;
+
+    // Ensure each session has a timestamp once (used by weekly summary)
+    if (!after.session_ts) {
+      try {
+        await event.data.after.ref.set(
+          { session_ts: admin.firestore.FieldValue.serverTimestamp() },
+          { merge: true }
+        );
+      } catch (e) {
+        console.error("set session_ts error:", e?.message || e);
+      }
+    }
+
+    const before = event.data?.before?.data();
+    const className = event.params.className;
+    const studentsAfter = after.students || {};
+    const studentsBefore = (before && before.students) || {};
+
+    if (!Object.keys(studentsAfter).length && !Object.keys(studentsBefore).length) return;
+
+    // For each student, if present changed: false -> true (or new true), DM them.
+    const tasks = Object.entries(studentsAfter).map(async ([code, info]) => {
+      const was = studentsBefore?.[code]?.present ?? false;
+      const now = info?.present ?? false;
+      const name = (info?.name || "").toString();
+
+      // Ignore tutors
+      if (/tutor/i.test(name)) return;
+
+      if (now && !was) {
+        const chatId = await chatIdForStudentCode(code);
+        if (!chatId) return; // skip if not registered
+
+        const delivered = await sendTelegramText(
+          chatId,
+          [
+            "🗓️ <b>Attendance update</b>",
+            `You were marked <b>present</b> for <b>${htmlEscape(className)}</b>.`,
+            "Keep it up!",
+          ].join("\n")
+        );
+        if (delivered) {
+          await notifyTeacher([`✅ Attendance DM delivered to ${htmlEscape(code)} (${htmlEscape(className)})`]);
+        }
+      }
+    });
+
+    await Promise.allSettled(tasks);
+  }
+);
+
+// ── 5) Weekly attendance summary (each Sunday 18:00 Africa/Accra) ────────────
+exports.weeklyAttendanceSummary = onSchedule(
+  {
+    region: "us-central1",
+    schedule: "every sunday 18:00",
+    timeZone: "Africa/Accra",
+    secrets: [BOT_TOKEN, TEACHER_CHAT_ID],
+  },
+  async () => {
+    const now = new Date();
+    const endMs = now.getTime();
+    const startMs = endMs - 7 * 24 * 60 * 60 * 1000;
+
+    const classDocs = await db.collection("attendance").listDocuments();
+    let totalDelivered = 0;
+    let classesProcessed = 0;
+
+    for (const classDoc of classDocs) {
+      const className = classDoc.id;
+      const sessionsRef = classDoc.collection("sessions");
+
+      // Only sessions with session_ts within the week window
+      const withTs = await sessionsRef
+        .where("session_ts", ">=", new Date(startMs))
+        .where("session_ts", "<=", new Date(endMs))
+        .get();
+
+      // Aggregate "present" from real marks this week
+      const perStudent = new Map(); // code -> { presentThisWeek: number }
+      for (const snap of withTs.docs) {
+        const data = snap.data() || {};
+        const students = data.students || {};
+        for (const [code, info] of Object.entries(students)) {
+          if (!code) continue;
+          if (/tutor/i.test(String(info?.name || ""))) continue; // ignore tutors
+          const curr = perStudent.get(code) || { presentThisWeek: 0 };
+          if (info?.present) curr.presentThisWeek += 1;
+          perStudent.set(code, curr);
+        }
+      }
+
+      // 🔢 Expected total sessions per week (fixed by level or override)
+      const expectedPerWeek = await getExpectedSessionsForClass(className);
+
+      // DM each student using expectedPerWeek as the denominator
+      const tasks = [];
+      for (const [code, agg] of perStudent.entries()) {
+        const chatId = await chatIdForStudentCode(code);
+        if (!chatId) continue;
+
+        const present = agg.presentThisWeek;
+        const missed  = Math.max(0, expectedPerWeek - present);
+        const ratePct = Math.round(Math.min(100, Math.max(0, (present / expectedPerWeek) * 100)));
+
+        const startStr = new Date(startMs).toISOString().slice(0, 10);
+        const endStr   = new Date(endMs).toISOString().slice(0, 10);
+
+        const msg = [
+          "📈 <b>Your weekly attendance</b>",
+          safeLine("Class", className),
+          safeLine("Week", `${startStr} → ${endStr}`),
+          safeLine("Expected sessions (per week)", expectedPerWeek),
+          safeLine("Present (marked this week)", present),
+          safeLine("Missed (this week)", missed),
+          safeLine("Rate", `${ratePct}%`),
+          "",
+          present >= Math.ceil(expectedPerWeek / 2)
+            ? "👏 Great job staying consistent!"
+            : "🚀 Let’s aim for more sessions next week!",
+        ].join("\n");
+
+        tasks.push(
+          sendTelegramText(chatId, msg).then((ok) => { if (ok) totalDelivered++; })
+        );
+      }
+
+      await Promise.allSettled(tasks);
+      classesProcessed++;
+    }
+
+    await notifyTeacher([
+      "🗓️ <b>Weekly attendance summary sent</b>",
+      safeLine("Classes", String(classesProcessed)),
+      safeLine("DMs delivered", String(totalDelivered)),
+    ]);
+  }
+);
+
+
+// ── 6) Telegram webhook: simple English onboarding & natural code capture ────
+exports.telegramWebhook = onRequest(
+  { region: "us-central1", invoker: "public", secrets: [BOT_TOKEN, WEBHOOK_SECRET] },
+  async (req, res) => {
+    try {
+      if (req.method !== "POST") return res.status(405).send("method not allowed");
+      if (!req.is("application/json")) return res.status(415).send("unsupported media type");
+
+      // Optional shared-secret header check
+      const expected = (WEBHOOK_SECRET.value && WEBHOOK_SECRET.value()) || "";
+      if (expected) {
+        const got = req.get("X-Telegram-Bot-Api-Secret-Token") || "";
+        if (got !== expected) return res.status(401).send("unauthorized");
+      }
+
+      // ACK first so Telegram doesn't retry
+      res.status(200).send("ok");
+
+      const update = req.body || {};
+      const msg = update.message || update.edited_message || null;
+      if (!msg || !msg.chat || typeof msg.chat.id === "undefined") return;
+
+      const chatId = String(msg.chat.id);
+      const text = (msg.text || "").trim().normalize("NFC");
+
+      // Pull user record (to know if they’re already linked / awaiting code)
+      const userRef = db.collection("telegram_users").doc(chatId);
+      const userSnap = await userRef.get();
+      const userData = userSnap.exists ? (userSnap.data() || {}) : {};
+      const awaiting = !!userData.awaiting_code;
+      const alreadyLinked = !!userData.student_code && userData.active !== false;
+
+      // Shortcuts / aliases that trigger “ask for code” UX
+      const wantsToLink = /^\/(start|help|join|link)\b/i.test(text) ||
+                          /link my account|join.*platform|connect me|get started/i.test(text);
+
+      // 0) /id
+      if (/^\/id\b/i.test(text)) {
+        return sendTelegramText(chatId, `<b>Your chat id:</b> <code>${htmlEscape(chatId)}</code>`);
+      }
+
+      // 1) stop/unsubscribe
+      if (/^\/stop\b/i.test(text)) {
+        await userRef.set(
+          { chat_id: chatId, active: false, awaiting_code: false, stopped_at: admin.firestore.FieldValue.serverTimestamp() },
+          { merge: true }
+        );
+        return sendTelegramText(chatId, "You’re unsubscribed. Send “Link my account” to connect again.", { reply_markup: removeKb() });
+      }
+
+      // 2) blog on/off (unchanged)
+      if (/^\/blogoff\b/i.test(text)) {
+        await userRef.set({ blog_opt_out: true, updated_at: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        return sendTelegramText(chatId, "You will no longer receive blog updates. Send “Enable blog updates” to re-subscribe.", { reply_markup: removeKb() });
+      }
+      if (/^\/blogon\b/i.test(text) || /enable blog updates/i.test(text)) {
+        await userRef.set({ blog_opt_out: false, updated_at: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        return sendTelegramText(chatId, "You are subscribed to blog updates.", { reply_markup: removeKb() });
+      }
+
+      // 3) COMMAND /register still supported
+      const reg = /^\/register\s+([A-Za-z0-9._:-]{3,})\s*$/i.exec(text);
+      if (reg) {
+        const code = reg[1].trim();
+        await linkStudentCode({ chatId, code, userRef });
+        return;
+      }
+
+      // 4) If they type in simple English or use /start|/help|/join|/link
+      if (wantsToLink) {
+        if (alreadyLinked) {
+          return sendTelegramText(
+            chatId,
+            [
+              "You’re already linked ✅",
+              safeLine("StudentCode", userData.student_code || "(unknown)"),
+              "",
+              "If you need to change your code, just type it here (e.g., <code>LG-2024-15</code>)."
+            ].join("\n"),
+            { reply_markup: replyKb([[{ text: "Change my student code" }]]) }
+          );
+        }
+        await userRef.set({ chat_id: chatId, awaiting_code: true, active: true, updated_at: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        return sendTelegramText(
+          chatId,
+          [
+            "<b>Let’s link your account</b>",
+            "Please reply with your <b>Student Code</b> (e.g., <code>LG-2024-15</code>).",
+            "You can simply type it — no slashes or commands needed."
+          ].join("\n"),
+          { reply_markup: replyKb([[{ text: "I don’t know my Student Code" }]]) }
+        );
+      }
+
+      // 5) Natural-language code capture at any time
+      const maybeCode = extractStudentCode(text);
+      if (maybeCode) {
+        await linkStudentCode({ chatId, code: maybeCode, userRef });
+        return;
+      }
+
+      // 6) If we’re awaiting a code but didn’t detect one, prompt again
+      if (awaiting) {
+        return sendTelegramText(
+          chatId,
+          [
+            "I didn’t catch a <b>Student Code</b> in that message.",
+            "Please reply with just your code (e.g., <code>LG-2024-15</code>)."
+          ].join("\n"),
+          { reply_markup: replyKb([[{ text: "I don’t know my Student Code" }]]) }
+        );
+      }
+
+      // 7) Unknown slash command
+      if (/^\/.+/.test(text)) {
+        return sendTelegramText(chatId, "Unknown command. Try “Link my account”.", { reply_markup: replyKb([[{ text: "Link my account" }]]) });
+      }
+
+      // 8) Friendly default
+      return sendTelegramText(
+        chatId,
+        "Hi! To get started, tap <b>Link my account</b> and share your Student Code.",
+        { reply_markup: replyKb([[{ text: "Link my account" }]]) }
+      );
+
+      // ── inner helper: link + welcome (reuses your existing welcome content) ──
+      async function linkStudentCode({ chatId, code, userRef }) {
+        // Save mapping
+        await userRef.set(
+          {
+            chat_id: chatId,
+            student_code: String(code),
+            active: true,
+            awaiting_code: false,
+            updated_at: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+
+        // Mirror onto roster
+        await db.collection("roster").doc(String(code)).set(
+          {
+            student_code: String(code),
+            chat_id: chatId,
+            chat_linked_at: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+
+        // Welcome + what to expect (same as your existing welcome)
+        const welcome = [
+          "✅ <b>All set!</b> Your account is linked.",
+          safeLine("StudentCode", code),
+          "",
+          "<b>What to expect here</b>",
+          "• New <b>scores</b> with feedback and links.",
+          "• <b>Classroom updates</b> (notes &amp; Q&amp;A) from your class.",
+          "• <b>Attendance</b> confirmations when marked present.",
+          "• A short <b>weekly attendance</b> summary every Sunday 18:00 (Africa/Accra).",
+          "• Occasional <b>Falowen Blog</b> updates (digest, quiet hours respected).",
+          "",
+          "You can mute blog posts with <code>/blogoff</code> and re-enable with <code>/blogon</code>.",
+          "To stop all messages, send <code>/stop</code>.",
+          "",
+          "For full feedback &amp; references:",
+          "• My Results &amp; Resources → https://www.falowen.app/?tab=My+Results+and+Resources",
+        ].join("\n");
+
+        await sendTelegramText(chatId, welcome, { reply_markup: removeKb() });
+        await notifyTeacher([`👤 Student linked: <b>${htmlEscape(code)}</b> (chat: ${htmlEscape(chatId)})`]);
+      }
+    } catch (e) {
+      try { res.status(200).send("ok"); } catch (_) {}
+      console.error("telegramWebhook error:", e?.message || e);
+    }
+  }
+);
+
+
+// ── 7) Blog: scheduled feed poll (deliveries-only teacher pings) ─────────────
+exports.blogUpdatesJob = onSchedule(
+  {
+    region: "us-central1",
+    schedule: "every 3 hours",
+    timeZone: "Africa/Accra",
+    secrets: [BOT_TOKEN, TEACHER_CHAT_ID],
+  },
+  async () => {
+    try {
+      const state      = await readBlogState();
+      const pending    = Array.isArray(state.pending) ? state.pending : [];
+      const lastSentMs = Number(state.lastSentMs || 0);
+      const seen       = state.seen || {}; // {hash: ms}
+
+      // Fetch & normalize (includes image)
+      const items = await fetchBlogFeed();
+
+      // Fresh = not seen + within lookback
+      const cutoff = Date.now() - BLOG_LOOKBACK_DAYS * 864e5;
+      const fresh = items
+        .filter(it => it.link || it.id)
+        .filter(it => (it.dateMs || 0) >= cutoff)
+        .filter(it => !seen[itemHash(it)]);
+
+      // Nothing fresh and no queue → exit quietly
+      if (!fresh.length && !pending.length) return;
+
+      // Merge queue + fresh; newest first
+      const allCandidates = dedupByHash([...pending, ...fresh])
+        .sort((a,b)=>(b.dateMs||0)-(a.dateMs||0));
+
+      // Cap how many we’ll send now
+      const toSend = allCandidates.slice(0, BLOG_MAX_ITEMS_PER_RUN);
+      if (!toSend.length) return;
+
+      // Build caption/text (digest if >1)
+      let caption, text, headerImg;
+      if (toSend.length === 1) {
+        const p = toSend[0];
+        headerImg = p.image || null;
+        caption = [
+          "📰 <b>Falowen Blog – New post</b>",
+          `<b>${htmlEscape(p.title)}</b>`,
+          p.summary ? htmlEscape(p.summary) : "",
+          p.link ? `\n<a href="${htmlEscape(p.link)}">Read on the blog</a>` : "",
+        ].filter(Boolean).join("\n");
+        text = caption;
+      } else {
+        headerImg = toSend[0].image || null;
+        const bullets = toSend.map(p =>
+          `• <b>${htmlEscape(p.title)}</b>${p.link ? ` — <a href="${htmlEscape(p.link)}">link</a>` : ""}`
+        ).join("\n");
+        caption = truncHtml([`📰 <b>Falowen Blog – ${toSend.length} new posts</b>`, bullets].join("\n"), 1000);
+        text = [`📰 <b>Falowen Blog – ${toSend.length} new posts</b>`, bullets].join("\n");
+      }
+
+      // Decide send vs queue (no teacher pings here)
+      const now     = Date.now();
+      const tooSoon = now - lastSentMs < BLOG_COOLDOWN_MS;
+      const quiet   = isWithinQuietHours(new Date(now));
+
+      if (BLOG_BROADCAST_TO_STUDENTS && !tooSoon && !quiet) {
+        // Send to students (photo preferred, text fallback)
+        let delivered = 0;
+        if (headerImg) {
+          delivered = await broadcastToAllActivePhoto(headerImg, caption, { silent: true });
+          if (!delivered) delivered = await broadcastToAllActive(text, { silent: true });
+        } else {
+          delivered = await broadcastToAllActive(text, { silent: true });
+        }
+
+        if (delivered > 0) {
+          // Mark sent as seen, keep leftovers queued
+          const sentHashes  = new Set(toSend.map(itemHash));
+          const remaining   = allCandidates.filter(p => !sentHashes.has(itemHash(p)));
+          const newSeen     = { ...(state.seen || {}) };
+          toSend.forEach(p => { newSeen[itemHash(p)] = now; });
+
+          // Trim state
+          const seenKeys = Object.keys(newSeen).sort((a,b)=>newSeen[b]-newSeen[a]).slice(0, 300);
+          const trimmedSeen = {}; seenKeys.forEach(k => trimmedSeen[k] = newSeen[k]);
+          const trimmedPending = remaining.slice(0, 100);
+
+          await writeBlogState({ lastSentMs: now, seen: trimmedSeen, pending: trimmedPending });
+
+          // ✅ Only teacher ping we keep: after successful delivery
+          const titles = toSend.map(p => p.title).slice(0,3).map(t => `• ${htmlEscape(t)}`).join("\n");
+          await notifyTeacher([
+            "✅ <b>Blog update delivered</b>",
+            safeLine("Recipients", String(delivered)),
+            titles
+          ]);
+        } else {
+          // Couldn’t deliver to any student → keep in queue, no teacher ping
+          const newPending = dedupByHash(allCandidates).slice(0, 100);
+          await writeBlogState({ pending: newPending });
+        }
+      } else {
+        // Quiet/cooldown → queue silently; no teacher ping
+        const newPending = dedupByHash(allCandidates).slice(0, 100);
+        await writeBlogState({ pending: newPending });
+      }
+    } catch (e) {
+      // Log errors only; do not notify teacher
+      console.error("blogUpdatesJob error:", e?.message || e);
+    }
+  }
+);
