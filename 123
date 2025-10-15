@@ -26,6 +26,7 @@ const BLOG_BROADCAST_TO_STUDENTS = true;     // set false to test quietly
 
 const BLOG_STATE_REF = db.collection("integrations").doc("rss_blog");
 
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function tsToMs(ts) {
   try {
@@ -69,6 +70,310 @@ async function getExpectedSessionsForClass(className) {
   // 4) Fallback default if unknown
   return 3;
 }
+
+// ── 8) M/W/F practice nudges (Telegram) ──────────────────────────────────────
+// Links: adjust if you have different deep-links.
+const SPEAK_LINK = "https://www.falowen.app/?tab=Sprechen+Trainer"; // set your real Sprechen URL if different
+const WRITE_LINK = "https://www.falowen.app/?t=YU99oBSG5bu0NXWyz7pdgkVzdqBil9iOBOIAE9LuQ5NuPRLuBWY7qytAfx9JNVQ7&tab=Schreiben+Trainer";
+
+exports.practiceReminderMWF = onSchedule(
+  {
+    region: "us-central1",
+    // 09:00 every Mon/Wed/Fri, Africa/Accra
+    schedule: "0 9 * * 1,3,5",
+    timeZone: "Africa/Accra",
+    secrets: [BOT_TOKEN, TEACHER_CHAT_ID],
+  },
+  async () => {
+    const now = Date.now();
+
+    const snap = await db.collection("exam_reminders")
+      .where("status", "==", "active")
+      .get();
+
+    let checked = 0, sent = 0, noChat = 0, skipped = 0;
+
+    for (const doc of snap.docs) {
+      checked++;
+      const d = doc.data() || {};
+      const code = (d.student_code || "").toString().trim();
+      if (!code) { skipped++; continue; }
+
+      const examMs = tsToMs(d.exam_date);
+      if (!examMs) { skipped++; continue; }
+
+      const days = Math.ceil((examMs - now) / 864e5);
+
+      // Stop if exam has passed and we've already sent final
+      if (days < 0 && d.final_sent) { skipped++; continue; }
+
+      const chatId = await chatIdForStudentCode(code);
+      if (!chatId) { noChat++; continue; }
+
+      // Build message
+      let text;
+      let flags = {};
+
+      if (!d.welcome_sent) {
+        text = [
+          "👋 <b>Welcome!</b> I’ll nudge you 3× per week till your exam.",
+          "Pick one today (10–15 mins):",
+          "• <b>Sprechen:</b> speak on a short prompt.",
+          "• <b>Schreiben:</b> write a short letter/paragraph.",
+          "",
+          safeLine("Level", d.level || ""),
+          safeLine("Exam date", new Date(examMs).toISOString().slice(0,10)),
+        ].join("\n");
+        flags.welcome_sent = true;
+
+      } else if (days <= 0 && !d.final_sent) {
+        text = [
+          "🎓 <b>It’s exam day!</b>",
+          "Do a quick warm-up:",
+          "• Say a 60-sec summary of any topic (Sprechen).",
+          "• Write 4–6 sentences about your day (Schreiben).",
+          "You’ve got this. Viel Erfolg! 🍀",
+        ].join("\n");
+        flags.final_sent = true;
+        // Optionally move to done:
+        // flags.status = "done";
+
+      } else {
+        text = [
+          "📌 <b>Practice nudge</b> — pick ONE:",
+          "• <b>Sprechen:</b> choose a prompt and record yourself (1–2 min).",
+          "• <b>Schreiben:</b> pick a prompt and write 6–10 sentences.",
+          "",
+          "Tiny steps add up. 💪",
+          days > 0 ? safeLine("Days to exam", days) : "",
+        ].filter(Boolean).join("\n");
+      }
+
+      // Inline buttons for quick open
+      const reply_markup = {
+        inline_keyboard: [[
+          { text: "🎤 Sprechen Trainer", url: SPEAK_LINK },
+          { text: "✍️ Schreiben Trainer", url: WRITE_LINK },
+        ]]
+      };
+
+      const ok = await sendTelegramText(chatId, text, { reply_markup });
+      if (!ok) { skipped++; continue; }
+
+      sent++;
+      await doc.ref.set(
+        {
+          ...flags,
+          last_email_sent: admin.firestore.FieldValue.serverTimestamp(), // reuse field to track last DM
+          updated_at: admin.firestore.FieldValue.serverTimestamp(),
+          // We intentionally ignore next_email_due here since schedule is fixed (MWF).
+        },
+        { merge: true }
+      );
+    }
+
+    await notifyTeacher([
+      "📬 <b>MWF practice nudges</b>",
+      safeLine("Docs checked", checked),
+      safeLine("DMs sent", sent),
+      safeLine("Missing chat link", noChat),
+      safeLine("Skipped/other", skipped),
+    ]);
+  }
+);
+
+// ── Exams countdown v2: revision nudges + Schreiben & Sprechen tips ──────────
+// (Teacher ping only when deliveries occurred.)
+
+// Use existing SPEAK_LINK / WRITE_LINK from above. Add optional extra links:
+const VOCAB_LINK = "https://www.falowen.app/?tab=Vocabulary+Quiz";
+const GRAMMAR_LINK = "https://www.falowen.app/?tab=Grammar+Practice";
+
+// --- Schreiben coaching micro-tips (English with short German fragments only)
+const SCHREIBEN_TIPS = {
+  A1: [
+    "Keep lines ~7–8 words. Split long lines.",
+    "Use only these connectors: ‘und’, ‘aber’, ‘weil’, ‘deshalb’, ‘ich möchte wissen, ob/wann’.",
+    "After ‘weil’ → verb at the end.",
+    "Requests: ‘Könnten Sie … [Infinitiv am Ende]?’ (verb at the end).",
+    "Greeting (formal): ‘Ich hoffe, es geht Ihnen gut. Ich schreibe Ihnen, weil … möchte.’",
+    "Greeting (informal): ‘Wie geht es dir? Ich schreibe dir, weil … möchte.’",
+    "Closing (formal): ‘Ich freue mich im Voraus auf Ihre Antwort.’ + ‘Mit freundlichen Grüßen,’ + [Name]",
+    "Closing (informal): ‘Ich freue mich im Voraus auf deine Antwort.’ + ‘Viele Grüße,’ + [Name]",
+    "Target length: 25–35 words.",
+    "Scenario fragments: ‘Termin absagen’; ‘Anfrage stellen’; ‘Wie viel kostet …?’; ‘neuen Termin vereinbaren’; ‘Es tut mir leid.’",
+  ],
+  A2: [
+    "Sequence your ideas: ‘Zuerst’ → ‘Dann/Außerdem’ → ‘Zum Schluss’.",
+    "Prefer one connector per short line.",
+    "Connectors: ‘und’, ‘aber’, ‘weil’, ‘denn’, ‘deshalb’, ‘ich möchte wissen, ob/wann/wo’.",
+    "Keep lines ~7–8 words; split long ones.",
+    "Formal intro: ‘Ich schreibe Ihnen, weil …’ (comma after ‘Ihnen’).",
+    "Informal intro: ‘Ich schreibe dir, weil …’ (comma after ‘dir’).",
+    "Include a polite closing cue: ‘Ich freue mich …’.",
+    "Letter length: 30–40 words.",
+    "Scenario fragments: ‘absagen (Wetter/Gesundheit)’, ‘Anfrage stellen’, ‘neuen Termin vereinbaren’, ‘Wie viel kostet …?’",
+  ],
+  B1: [
+    "Choose type: formal letter, informal letter, or opinion essay.",
+    "Use clear paragraph starters; short sentences.",
+    "Add 1–2 idea fragments after each line you write.",
+    "Targets: formal letter 40–50 words; informal/opinion 80–90 words.",
+    "Forum greetings (one): ‘Hallo zusammen,’ ‘Liebe Forenmitglieder,’ ‘Liebes Forum,’ ‘Liebe Community,’",
+    "Opinion skeleton (fragments): ‘Heutzutage Thema …’; ‘Ich bin der Meinung, dass …, weil …’; ‘Einerseits … (Zum Beispiel …)’; ‘Andererseits … (Ein Beispiel …)’; ‘Ich glaube, dass …’; ‘Zusammenfassend …’",
+  ],
+};
+
+// --- Goethe Sprechen “pass” tips per level (short, exam-focused)
+const SPRECHEN_TIPS = {
+  A1: [
+    "Intro: Name, Land, Wohnort, Alter, Sprachen, Beruf, Hobby.",
+    "Question forms: W-Wort/Verb first; end with ‘?’.",
+    "Requests: ‘Können Sie bitte …?’ ‘Machen Sie bitte …’",
+    "Be ready to spell your name and say dates/numbers.",
+    "Keep it short (1–2 simple sentences); ‘und/aber’ only if needed.",
+  ],
+  A2: [
+    "Dialoge: begrüßen, 2–3 Fragen, höflich reagieren.",
+    "Sequencing when describing: ‘Zuerst’, ‘Dann’, ‘Zum Schluss’.",
+    "If confused: ‘Könnten Sie das wiederholen, bitte?’",
+    "Use ‘weil’ → verb at the end; short sentences.",
+    "Aim 60–90 sec per prompt; steady pace.",
+  ],
+  B1: [
+    "3 parts: intro → 2–3 points → mini conclusion.",
+    "Use ‘Einerseits/Andererseits’ + simple examples.",
+    "Fillers: ‘Einen Moment …’, ‘Ich denke …’, ‘Gute Frage …’.",
+    "Keep grammar simple; present + modals; short clear lines.",
+    "Opinions: ‘Ich bin der Meinung, dass …’, ‘Ich finde …, weil …’.",
+  ],
+};
+
+// pick n random unique tips
+function pickTips(arr = [], n = 1) {
+  if (!arr.length) return [];
+  const out = new Set();
+  while (out.size < Math.min(n, arr.length)) {
+    out.add(arr[Math.floor(Math.random() * arr.length)]);
+  }
+  return Array.from(out);
+}
+
+function buildDailyRevisionText({ level = "A1", daysToExam = null }) {
+  const lvl = String(level || "A1").toUpperCase();
+  const schreiben = SCHREIBEN_TIPS[lvl] || SCHREIBEN_TIPS.A1 || [];
+  const sprechen  = SPRECHEN_TIPS[lvl]   || SPRECHEN_TIPS.A1   || [];
+
+  const sTips = pickTips(schreiben, 2);
+  const pTips = pickTips(sprechen, 2);
+
+  const countdown =
+    Number.isFinite(daysToExam)
+      ? (daysToExam > 0 ? safeLine("Days to exam", daysToExam)
+         : daysToExam === 0 ? "<b>It’s exam day!</b>"
+         : safeLine("Days since exam", Math.abs(daysToExam)))
+      : "";
+
+  const header = daysToExam === 0
+    ? "🎯 <b>Exam warm-up</b>"
+    : "📚 <b>Daily exam revision</b>";
+
+  const lines = [
+    header,
+    countdown,
+    safeLine("Level", lvl),
+    "",
+    "✍️ <b>Schreiben — do one:</b>",
+    ...sTips.map(t => `• ${t}`),
+    "",
+    "🎤 <b>Sprechen — do one:</b>",
+    ...pTips.map(t => `• ${t}`),
+    "",
+    "Open a trainer:",
+    `• <a href="${htmlEscape(SPEAK_LINK)}">Sprechen Trainer</a>`,
+    `• <a href="${htmlEscape(WRITE_LINK)}">Schreiben Trainer</a>`,
+  ];
+
+  return lines.filter(Boolean).join("\n");
+}
+
+
+exports.examRevisionDaily = onSchedule(
+  {
+    region: "us-central1",
+    // 18:00 every day Africa/Accra
+    schedule: "0 18 * * *",
+    timeZone: "Africa/Accra",
+    secrets: [BOT_TOKEN, TEACHER_CHAT_ID],
+  },
+  async () => {
+    try {
+      const now = Date.now();
+      const snap = await db.collection("exam_reminders")
+        .where("status", "==", "active")
+        .get();
+
+      let checked = 0, delivered = 0, noChat = 0, skipped = 0;
+
+      for (const doc of snap.docs) {
+        checked++;
+        try {
+          const d = doc.data() || {};
+          const code = (d.student_code || "").toString().trim();
+          if (!code) { skipped++; continue; }
+
+          const examMs = tsToMs(d.exam_date);
+          if (!examMs) { skipped++; continue; }
+
+          const days = Math.ceil((examMs - now) / 864e5);
+          if (days < 0 && d.final_sent) { skipped++; continue; }
+
+          const chatId = await chatIdForStudentCode(code);
+          if (!chatId) { noChat++; continue; }
+
+          // ---- build your daily revision message here (A1/A2/B1 tips etc.) ----
+          const text = buildDailyRevisionText({ level: d.level, daysToExam: days });
+          const ok = await sendTelegramText(chatId, text, {
+            reply_markup: {
+              inline_keyboard: [[
+                { text: "🎤 Sprechen Trainer", url: SPEAK_LINK },
+                { text: "✍️ Schreiben Trainer", url: WRITE_LINK },
+              ]]
+            }
+          });
+          if (!ok) { skipped++; continue; }
+
+          delivered++;
+          await doc.ref.set({
+            last_email_sent: admin.firestore.FieldValue.serverTimestamp(),
+            updated_at: admin.firestore.FieldValue.serverTimestamp(),
+          }, { merge: true });
+
+        } catch (inner) {
+          console.error("examRevisionDaily per-doc error:", inner?.message || inner);
+          skipped++;
+          // continue to next student without failing the whole job
+        }
+      }
+
+      // ✅ Only ping teacher if something was actually delivered
+      if (delivered > 0) {
+        await notifyTeacher([
+          "🎯 <b>Exam revision reminders delivered</b>",
+          safeLine("Docs checked", checked),
+          safeLine("DMs delivered", delivered),
+          noChat ? safeLine("Missing chat link", noChat) : "",
+          skipped ? safeLine("Skipped/other", skipped) : "",
+        ].filter(Boolean));
+      }
+
+    } catch (e) {
+      // Log top-level error but do NOT rethrow → scheduler run shows Success
+      console.error("examRevisionDaily top-level error:", e?.message || e);
+    }
+  }
+);
+
 
 
 function bestTimeMs(data, meta = {}) {
@@ -1167,9 +1472,11 @@ exports.telegramWebhook = onRequest(
       const awaiting = !!userData.awaiting_code;
       const alreadyLinked = !!userData.student_code && userData.active !== false;
 
-      // Shortcuts / aliases that trigger “ask for code” UX
-      const wantsToLink = /^\/(start|help|join|link)\b/i.test(text) ||
-                          /link my account|join.*platform|connect me|get started/i.test(text);
+      // Shortcuts / aliases that trigger “ask for code” UX (now also handles plain "start")
+      const wantsToLink =
+        /^\/(start|help|join|link)\b/i.test(text) ||
+        /^(start|get started)\b/i.test(text) ||
+        /link my account|join.*platform|connect me|get started/i.test(text);
 
       // 0) /id
       if (/^\/id\b/i.test(text)) {
@@ -1185,7 +1492,7 @@ exports.telegramWebhook = onRequest(
         return sendTelegramText(chatId, "You’re unsubscribed. Send “Link my account” to connect again.", { reply_markup: removeKb() });
       }
 
-      // 2) blog on/off (unchanged)
+      // 2) blog on/off
       if (/^\/blogoff\b/i.test(text)) {
         await userRef.set({ blog_opt_out: true, updated_at: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
         return sendTelegramText(chatId, "You will no longer receive blog updates. Send “Enable blog updates” to re-subscribe.", { reply_markup: removeKb() });
@@ -1221,9 +1528,14 @@ exports.telegramWebhook = onRequest(
         return sendTelegramText(
           chatId,
           [
-            "<b>Let’s link your account</b>",
-            "Please reply with your <b>Student Code</b> (e.g., <code>LG-2024-15</code>).",
-            "You can simply type it — no slashes or commands needed."
+            "👋 <b>Welcome to Falowen</b>",
+            "",
+            "<b>How to register (link your account)</b>",
+            "1) Reply here with your <b>Student Code</b> exactly as given.",
+            "   Example: <code>LG-2024-15</code>",
+            "2) I’ll confirm you’re linked and explain what I’ll send you.",
+            "",
+            "Don’t know your code? Tap the button below.",
           ].join("\n"),
           { reply_markup: replyKb([[{ text: "I don’t know my Student Code" }]]) }
         );
@@ -1284,7 +1596,7 @@ exports.telegramWebhook = onRequest(
           { merge: true }
         );
 
-        // Welcome + what to expect (same as your existing welcome)
+        // Welcome + what to expect
         const welcome = [
           "✅ <b>All set!</b> Your account is linked.",
           safeLine("StudentCode", code),
@@ -1312,6 +1624,44 @@ exports.telegramWebhook = onRequest(
     }
   }
 );
+
+// --- Exam-cohort controls ---
+if (/^\/examstatus\b/i.test(text)) {
+  const code = userData.student_code || "";
+  if (!code) return sendTelegramText(chatId, "No student code linked. Use “Link my account” first.");
+  const d = await fetchExamDocByCode(code);
+  if (!d) return sendTelegramText(chatId, "No active exam reminder is set for your code yet.");
+  const examMs = tsToMs(d.exam_date);
+  const days = examMs ? Math.ceil((examMs - Date.now()) / 864e5) : null;
+  return sendTelegramText(
+    [
+      "📅 <b>Your exam reminder status</b>",
+      safeLine("Level", d.level || ""),
+      examMs ? safeLine("Exam date", new Date(examMs).toISOString().slice(0,10)) : "",
+      Number.isFinite(days) ? safeLine("Days to exam", days) : "",
+      safeLine("Status", d.status || ""),
+      d.last_email_sent ? safeLine("Last DM", new Date(tsToMs(d.last_email_sent)).toISOString().replace("T"," ").slice(0,16)) : "",
+    ].filter(Boolean).join("\n")
+  );
+}
+
+if (/^\/examon\b/i.test(text)) {
+  const code = userData.student_code || "";
+  if (!code) return sendTelegramText(chatId, "No student code linked. Use “Link my account” first.");
+  const ref = await examDocRefByCode(code);
+  if (!ref) return sendTelegramText(chatId, "No exam reminder found for your code.");
+  await ref.set({ status: "active", updated_at: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+  return sendTelegramText(chatId, "Exam reminders are <b>ON</b>. You’ll receive daily revision at 18:00 and M/W/F nudges.");
+}
+
+if (/^\/examstop\b/i.test(text)) {
+  const code = userData.student_code || "";
+  if (!code) return sendTelegramText(chatId, "No student code linked. Use “Link my account” first.");
+  const ref = await examDocRefByCode(code);
+  if (!ref) return sendTelegramText(chatId, "No exam reminder found for your code.");
+  await ref.set({ status: "paused", updated_at: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+  return sendTelegramText(chatId, "Exam reminders are <b>paused</b>. Send /examon to resume.");
+}
 
 
 // ── 7) Blog: scheduled feed poll (deliveries-only teacher pings) ─────────────
